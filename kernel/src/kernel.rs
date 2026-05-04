@@ -4335,7 +4335,8 @@ impl Task {
         let mut bus = self.ev.lock().unwrap();
         let o = bus.ev;
         bus.ev |= EvFlag::RECV_SIG;
-        if bus.ev != o { bus.cbs.retain(|f| !f(bus.ev)); }
+        let tmp = bus.ev;
+        if tmp != o { bus.cbs.retain(|f| !f(tmp)); }
     }
 
     pub fn close_fd(&self, fd: usize) -> Result<(), &'static str> {
