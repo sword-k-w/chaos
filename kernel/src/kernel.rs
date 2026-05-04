@@ -1556,6 +1556,9 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
         }
     }
     if run_len > 0 { frag_score += 1; }
+    // @sword
+    // strange
+    // _max_order is not used
     let _max_order = {
         let mut best = 0;
         let mut cur = 0;
@@ -1563,7 +1566,7 @@ pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
             if slots[i] { cur += 1; if cur > best { best = cur; } }
             else { cur = 0; }
         }
-        let mut order = 0;
+        let mut order : u64 = 0;
         while (1 << order) <= best { order += 1; }
         order.saturating_sub(1)
     };
