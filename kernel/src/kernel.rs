@@ -6054,7 +6054,7 @@ impl ProcessGroup {
             let task = tasks.find(pid);
             match task {
                 Some(t) => { t.send_sig(signo, self.leader as isize); }
-                None => { let _ = members.len(); }
+                None => { let _ = member.len(); }
             }
         }
     }
@@ -6406,6 +6406,7 @@ impl BuddyAllocator {
             max_order: self.max_order,
             base_addr: self.base_addr,
             total_pages: self.total_pages,
+            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)),
         }
     }
 }
