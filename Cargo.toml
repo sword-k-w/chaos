@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+members = [
+    "chaos-tests",
+    "rboot",
+    "modules/hello_rust",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
