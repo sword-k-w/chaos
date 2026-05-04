@@ -3720,7 +3720,7 @@ impl Context {
             0..=3 => v & 0x0FFF_FFFF_FFFF_FFFF,
             4..=7 => (v << 4) >> 4,
             8..=11 => v.wrapping_neg(),
-            _ => self.r.get(idx),
+            _ => *self.r.get(idx).unwrap(),
         }
     }
 }
