@@ -1928,7 +1928,8 @@ impl FLike {
                 }
                 if d.buf.is_empty() {
                     d.bus.ev &= !EvFlag::READABLE;
-                    d.bus.cbs.retain(|f| !f(d.bus.ev));
+                    let tmp = d.bus.ev;
+                    d.bus.cbs.retain(|f| !f(tmp));
                 }
                 Ok(take)
             }
