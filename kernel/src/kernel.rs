@@ -1630,7 +1630,7 @@ pub struct FHandle {
     pub path: String,
     pub data: Arc<Mutex<Vec<u8>>>,
     desc: Arc<RwLock<FdState>>,
-    pub pipe: bool,
+    pub pipe: bool, // [strange], unused
     pub cloexec: bool,
 }
 
@@ -4154,7 +4154,7 @@ pub struct Task {
     pub info: Mutex<TaskInfo>,
     pub parent: Mutex<Option<Arc<Task>>>,
     pub subtasks: Mutex<Vec<Arc<Task>>>,
-    pub files: Mutex<BTreeMap<usize, FLike>>,
+    pub files: Mutex<BTreeMap<usize, FLike>>, // fd table
     pub cwd: Mutex<String>,
     pub exec_path: Mutex<String>,
     pub futexes: Mutex<BTreeMap<usize, Arc<FutexBucket>>>,
@@ -4539,9 +4539,9 @@ impl TaskTable {
         let sp = init.push_at(USR_STK_OFF + USR_STK_SZ);
         ctx.uctx.set_sp(sp as u64);
         *t.thd_ctx.lock().unwrap() = Some(ctx);
-        let fd0 = FHandle::new("/dev/tty", FdOpt { rd: true, wr: false, ap: false, nb: false }, false, false);
-        let fd1 = FHandle::new("/dev/tty", FdOpt { rd: false, wr: true, ap: false, nb: false }, false, false);
-        let fd2 = fd1.dup(false);
+        let fd0 = FHandle::new("/dev/tty", FdOpt { rd: true, wr: false, ap: false, nb: false }, false, false); // Stdin
+        let fd1 = FHandle::new("/dev/tty", FdOpt { rd: false, wr: true, ap: false, nb: false }, false, false); // Stdout
+        let fd2 = fd1.dup(false); // Stderr? [strange]
         {
             let mut fl = t.files.lock().unwrap();
             fl.insert(0, FLike::File(fd0));
@@ -4832,9 +4832,8 @@ impl Kernel {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
                     let opt = FdOpt { rd, wr, ap: _append, nb: _nonblock };
-                    let fh = FHandle::open("anon", opt);
-                    fh.cloexec = _cloexec;
-                    let fd = t.add_file(FLike::File(Arc::new(fh)));
+                    let fh = FHandle::new("anon", opt, false, _cloexec); // [doubtful] correctness of the value of pipe is uncertain
+                    let fd = t.add_file(FLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
                             if let FLike::File(ref f) = fl { let _ = f.set_len(0); }
