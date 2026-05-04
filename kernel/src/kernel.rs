@@ -1785,7 +1785,7 @@ impl FHandle {
         let n = min(count, avail);
         let chunk: Vec<u8> = sd[src_off as usize..src_off as usize + n].to_vec();
         drop(sd);
-        self.desc.write().unwrap().off += n;
+        self.desc.write().unwrap().off += n as u64;
         dst.write(&chunk)
     }
 }
