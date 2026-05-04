@@ -3421,7 +3421,7 @@ impl SigSet {
                 result |= 1 << i;
             }
         }
-        result
+        result as u64
     }
 
     pub fn sig_clear(&mut self, signo: u32) {
