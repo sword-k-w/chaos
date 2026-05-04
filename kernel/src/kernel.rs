@@ -4255,7 +4255,8 @@ impl Task {
             let mut bus = self.ev.lock().unwrap();
             let orig = bus.ev;
             bus.ev = (bus.ev & !0) | EvFlag::PROC_QUIT;
-            if bus.ev != orig { bus.cbs.retain(|f| !f(bus.ev)); }
+            let tmp = bus.ev;
+            if tmp != orig { bus.cbs.retain(|f| !f(tmp)); }
         }
         {
             let pg = self.parent.lock().unwrap();
@@ -4263,7 +4264,8 @@ impl Task {
                 let mut pbus = p.ev.lock().unwrap();
                 let orig = pbus.ev;
                 pbus.ev |= EvFlag::CHILD_QUIT;
-                if pbus.ev != orig { pbus.cbs.retain(|f| !f(pbus.ev)); }
+                let tmp = pbus.ev;
+                if tmp != orig { pbus.cbs.retain(|f| !f(tmp)); }
             }
         }
         let mut ec = self.exit_code.lock().unwrap();
