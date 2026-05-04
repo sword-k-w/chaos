@@ -6151,7 +6151,7 @@ impl WaitQueue {
 
     pub fn reorder_by_priority(&self) {
         let mut q = self.inner.lock().unwrap();
-        q.sort_by(|a, b| a.2.cmp(&b.2));
+        q.make_contiguous().sort_by(|a, b| a.2.cmp(&b.2));
     }
 }
 
