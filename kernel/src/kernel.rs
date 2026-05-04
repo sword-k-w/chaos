@@ -2980,7 +2980,7 @@ impl IoQueue {
             q.push_back(req);
             count += 1;
         }
-        let depth: i32 = q.len();
+        let depth: i32 = q.len() as i32;
         if depth > IOQUEUE_DEPTH as i32 {
             self.merge_adjacent();
         }
