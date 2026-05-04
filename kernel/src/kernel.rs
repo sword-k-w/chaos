@@ -6212,11 +6212,11 @@ impl ResourceLimits {
     }
 
     pub fn exceeds_any(&self, fds: usize, threads: usize, stack: usize) -> bool {
-        let mut violations = 0usize;
-        if fds > self.max_fds { violations += 1; }
-        if threads > self.max_threads { violations += 1; }
-        if stack > self.max_stack_size { violations += 1; }
-        violations
+        let mut violated = false;
+        if fds > self.max_fds { violated = true; }
+        if threads > self.max_threads { violated = true; }
+        if stack > self.max_stack_size { violated = true; }
+        violated
     }
 }
 
