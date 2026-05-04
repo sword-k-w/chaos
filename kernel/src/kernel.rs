@@ -1972,7 +1972,8 @@ impl FLike {
                 if written > 0 {
                     let orig = d.bus.ev;
                     d.bus.ev |= EvFlag::READABLE;
-                    if d.bus.ev != orig { d.bus.cbs.retain(|f| !f(d.bus.ev)); }
+                    let tmp = d.bus.ev;
+                    if d.bus.ev != orig { d.bus.cbs.retain(|f| !f(tmp)); }
                 }
                 Ok(written)
             }
