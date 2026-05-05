@@ -466,27 +466,12 @@ impl Channel {
     }
     pub fn recv(&self) -> Option<u8> {
         self.guard.acquire();
-        let result = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let result = self.buf.lock().unwrap().pop();
         if result.is_some() {
             self.guard.release();
             return result;
         }
-        if self.shut.load(Ordering::Relaxed) {
+        if self.is_closed() {
             self.guard.release();
             return None;
         }
@@ -505,24 +490,9 @@ impl Channel {
                 }
             }
         }
-        let v = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.rd = ring.rd.wrapping_add(1);
-                let idx = ring.rd % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.rd = ring.rd.wrapping_sub(1);
-                    None
-                }
-            } else {
-                None
-            }
-        };
+        let result = self.buf.lock().unwrap().pop(); // [strange] If thread is waken and buf is empty again...
         self.guard.release();
-        v
+        result
     }
     pub fn send(&self, v: u8) -> bool {
         let success = {
