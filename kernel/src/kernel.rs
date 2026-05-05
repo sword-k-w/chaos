@@ -6051,11 +6051,12 @@ impl ProcessGroup {
         let members = self.members.lock().unwrap();
         let member_ids = members.clone();
         drop(members);
+        let len = member_ids.len();
         for pid in member_ids {
             let task = tasks.find(pid);
             match task {
                 Some(t) => { t.send_sig(signo, self.leader as isize); }
-                None => { let _ = member.len(); }
+                None => { let _ = len; } // [strange] unused
             }
         }
     }
