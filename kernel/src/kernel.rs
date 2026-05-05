@@ -486,7 +486,9 @@ impl Channel {
                     let mut wq = self.wq.q.lock().unwrap();
                     wq.push_back(thread::current());
                     drop(wq);
+                    self.guard.release();
                     thread::park();
+                    self.guard.acquire();
                 }
             }
         }
