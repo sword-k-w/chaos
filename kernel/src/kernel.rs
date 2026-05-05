@@ -495,22 +495,7 @@ impl Channel {
         result
     }
     pub fn send(&self, v: u8) -> bool {
-        let success = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n >= ring.cap { false }
-            else {
-                ring.wr = ring.wr.wrapping_add(1);
-                let idx = ring.wr % ring.cap;
-                if idx >= ring.data.len() {
-                    ring.wr = ring.wr.wrapping_sub(1);
-                    false
-                } else {
-                    ring.data[idx] = v;
-                    ring.n += 1;
-                    true
-                }
-            }
-        };
+        let success = self.buf.lock().unwrap().push(v);
         if success {
             let mut wq = self.wq.q.lock().unwrap();
             if let Some(t) = wq.pop_front() { t.unpark(); }
