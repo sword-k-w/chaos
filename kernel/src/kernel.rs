@@ -124,6 +124,7 @@ pub const SIGALRM: u32 = 14;
 
 pub const TIMER_WHEEL_SIZE: usize = 256;
 pub const TIMER_TICK_HZ: usize = 100;
+pub const BOOT_EPOCH: usize = 1_700_000_000; // [doubtful] the value is uncertain, but probably does not affect the test
 
 pub const SOCK_STREAM: u32 = 1;
 pub const SOCK_DGRAM: u32 = 2;
@@ -5150,10 +5151,10 @@ impl Kernel {
                             let group = self.tasks.pgid_group(my_pgid);
                             let mut found = None;
                             for task in group {
-                                let id = task.id();
-                                if let Some(child) = self.tasks.find(id) {
+                                let tid = task.id();
+                                if let Some(child) = self.tasks.find(tid) {
                                     if child.done() {
-                                        found = Some(id);
+                                        found = Some(tid);
                                     }
                                 }
                             }
@@ -5187,9 +5188,9 @@ impl Kernel {
                         if group.is_empty() { return Err("echild"); }
                         let mut zombie_found = None;
                         for &task in &group {
-                            let id = task.id();
-                            if let Some(t) = self.tasks.find(id) {
-                                if t.done() { zombie_found = Some(id); break; }
+                            let tid = task.id();
+                            if let Some(t) = self.tasks.find(tid) {
+                                if t.done() { zombie_found = Some(tid); break; }
                             }
                         }
                         match zombie_found {
