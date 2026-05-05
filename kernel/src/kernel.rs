@@ -4600,6 +4600,7 @@ pub struct Kernel {
     pub sem_store: RwLock<BTreeMap<u32, Weak<SemArr>>>,
     pub shm_store: RwLock<BTreeMap<usize, Weak<Mutex<Vec<usize>>>>>,
     pub tty_buf: Mutex<VecDeque<u8>>,
+    pub disk: Disk, // [doubtful] I don't know why this is here, but let's just keep it for now
 }
 impl Kernel {
     pub fn new(nf: usize) -> Self {
@@ -4612,6 +4613,7 @@ impl Kernel {
             sem_store: RwLock::new(BTreeMap::new()),
             shm_store: RwLock::new(BTreeMap::new()),
             tty_buf: Mutex::new(VecDeque::new()),
+            disk: Disk::new("I don't know"),
         }
     }
     pub fn tick(&self, id: usize) {
