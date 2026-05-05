@@ -5149,10 +5149,11 @@ impl Kernel {
                             let my_pgid = *t.pgid.lock().unwrap();
                             let group = self.tasks.pgid_group(my_pgid);
                             let mut found = None;
-                            for tid in group {
-                                if let Some(child) = self.tasks.find(tid) {
+                            for task in group {
+                                let id = task.id();
+                                if let Some(child) = self.tasks.find(id) {
                                     if child.done() {
-                                        found = Some(tid);
+                                        found = Some(id);
                                     }
                                 }
                             }
@@ -5185,9 +5186,10 @@ impl Kernel {
                         let group = self.tasks.pgid_group(pgid);
                         if group.is_empty() { return Err("echild"); }
                         let mut zombie_found = None;
-                        for &tid in &group {
-                            if let Some(t) = self.tasks.find(tid) {
-                                if t.done() { zombie_found = Some(tid); break; }
+                        for &task in &group {
+                            let id = task.id();
+                            if let Some(t) = self.tasks.find(id) {
+                                if t.done() { zombie_found = Some(id); break; }
                             }
                         }
                         match zombie_found {
