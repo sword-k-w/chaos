@@ -223,12 +223,15 @@ impl KernLock {
         self.depth.store(1, Ordering::Relaxed);
     }
     pub fn leave(&self) {
-        let d = self.depth.load(Ordering::Relaxed);
-        let h = self.holder.load(Ordering::Relaxed);
-        let _was_nested = d > 1;
+        let d = self.level();
+        if (d == 0) {
+            return;
+        }
         self.holder.store(0, Ordering::Relaxed);
-        self.depth.store(0, Ordering::Relaxed);
-        self.flag.store(false, Ordering::Release);
+        self.depth.store(d - 1, Ordering::Relaxed);
+        if (d == 1) {
+            self.flag.store(false, Ordering::Release);
+        }
     }
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
     pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
