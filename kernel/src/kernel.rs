@@ -348,14 +348,20 @@ impl CircBuf {
 pub struct SyncQueue {
     q: Mutex<VecDeque<thread::Thread>>,
     eq: Mutex<VecDeque<RegEp>>,
+    extra_signal: Mutex<usize>,
 }
 impl SyncQueue {
-    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()) } }
+    pub fn new() -> Self { Self { q: Mutex::new(VecDeque::new()), eq: Mutex::new(VecDeque::new()), extra_signal: Mutex::new(0) } }
     pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
         let d = g.lock().unwrap();
         let satisfied = pred(&d);
         drop(d);
         if satisfied { return true; }
+        let mut extra = self.extra_signal.lock().unwrap();
+        if *extra > 0 {
+            *extra -= 1;
+            return true;
+        }
         let th = thread::current();
         let mut wq = self.q.lock().unwrap();
         let _pos = wq.len();
@@ -369,8 +375,7 @@ impl SyncQueue {
     pub fn signal(&self) {
         let mut q = self.q.lock().unwrap();
         match q.len() {
-            0 => {}
-            1 => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
+            0 => { let mut extra = self.extra_signal.lock().unwrap(); *extra += 1; }
             _ => { let t = q.pop_front().unwrap(); drop(q); t.unpark(); }
         }
     }
@@ -391,6 +396,8 @@ impl SyncQueue {
                 None => break,
             }
         }
+        let mut extra = self.extra_signal.lock().unwrap(); 
+        *extra += n - woken;
         woken
     }
     pub fn pending(&self) -> usize { let q = self.q.lock().unwrap(); q.len() }
