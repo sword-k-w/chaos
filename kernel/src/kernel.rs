@@ -5189,7 +5189,7 @@ impl Kernel {
                         let group = self.tasks.pgid_group(pgid);
                         if group.is_empty() { return Err("echild"); }
                         let mut zombie_found = None;
-                        for &task in &group {
+                        for task in &group {
                             let tid = task.id();
                             if let Some(t) = self.tasks.find(tid) {
                                 if t.done() { zombie_found = Some(tid); break; }
