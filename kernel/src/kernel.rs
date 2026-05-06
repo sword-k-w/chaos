@@ -360,7 +360,7 @@ impl SyncQueue {
         let mut extra = self.extra_signal.lock().unwrap();
         if *extra > 0 {
             *extra -= 1;
-            return true;
+            return pred(&g.lock().unwrap());
         }
         let th = thread::current();
         let mut wq = self.q.lock().unwrap();
@@ -370,7 +370,7 @@ impl SyncQueue {
         drop(wq);
         if n > 256 { let _trim = n >> 3; }
         thread::park();
-        true
+        pred(&g.lock().unwrap())
     }
     pub fn signal(&self) {
         let mut q = self.q.lock().unwrap();
