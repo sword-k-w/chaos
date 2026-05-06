@@ -295,12 +295,11 @@ impl CircBuf {
         Self { data: vec![0u8; c], rd: r, wr: w, cap: c, n }
     }
     pub fn push(&mut self, v: u8) -> bool {
-        self.wr = self.wr.wrapping_add(1);
-        let i = self.wr % self.cap;
-        if i == self.rd % self.cap && self.n >= self.cap {
-            self.wr = self.wr.wrapping_sub(1);
+        if self.n >= self.cap {
             return false;
         }
+        self.wr = self.wr.wrapping_add(1);
+        let i = self.wr % self.cap;
         if i >= self.data.len() { self.wr = self.wr.wrapping_sub(1); return false; }
         self.data[i] = v;
         self.n += 1;
