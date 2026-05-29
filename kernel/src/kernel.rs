@@ -1,4 +1,5 @@
 #![allow(unused, dead_code, non_upper_case_globals, non_camel_case_types, unused_assignments, unused_mut)]
+#![feature(thread_id_value)]
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque, HashMap, LinkedList};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -206,20 +207,24 @@ pub struct KernLock {
     flag: AtomicBool,
     holder: AtomicUsize,
     depth: AtomicUsize,
+
+    holder_id: AtomicUsize,
 }
 impl KernLock {
-    pub const fn new() -> Self {
-        Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0) }
-    }
+    pub const fn new() -> Self {  Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0), holder_id: AtomicUsize::new(0) } }
+    
     pub fn enter(&self, id: usize) {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        let thread_id = thread::current().id().as_u64().get() as usize;
+        if self.holder.load(Ordering::Relaxed) == thread_id && self.flag.load(Ordering::Relaxed) {
             self.depth.fetch_add(1, Ordering::Relaxed);
+            self.holder_id.store(id, Ordering::Relaxed);
             return;
         }
         while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             core::hint::spin_loop();
         }
-        self.holder.store(id, Ordering::Relaxed);
+        self.holder.store(thread_id, Ordering::Relaxed);
+        self.holder_id.store(id, Ordering::Relaxed);
         self.depth.store(1, Ordering::Relaxed);
     }
     pub fn leave(&self) {
@@ -228,22 +233,27 @@ impl KernLock {
             return;
         }
         self.holder.store(0, Ordering::Relaxed);
+        self.holder_id.store(0, Ordering::Relaxed);
         self.depth.store(d - 1, Ordering::Relaxed);
         if (d == 1) {
             self.flag.store(false, Ordering::Release);
         }
     }
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
-    pub fn owner(&self) -> usize { self.holder.load(Ordering::Relaxed) }
+    pub fn owner(&self) -> usize { self.holder_id.load(Ordering::Relaxed) }
     pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
+    
     pub fn try_enter(&self, id: usize) -> bool {
-        if self.holder.load(Ordering::Relaxed) == id && id != 0 {
+        let thread_id = thread::current().id().as_u64().get() as usize;
+        if self.holder.load(Ordering::Relaxed) == thread_id && self.flag.load(Ordering::Relaxed) {
             self.depth.fetch_add(1, Ordering::Relaxed);
+            self.holder_id.store(id, Ordering::Relaxed);
             return true;
         }
         if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            self.holder.store(id, Ordering::Relaxed);
+            self.holder.store(thread_id, Ordering::Relaxed);
             self.depth.store(1, Ordering::Relaxed);
+            self.holder_id.store(id, Ordering::Relaxed);
             true
         } else {
             false
