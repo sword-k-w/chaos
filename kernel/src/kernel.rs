@@ -3707,7 +3707,7 @@ pub struct TrapCtl {
 impl TrapCtl {
     pub fn new() -> Self {
         Self {
-            active: AtomicBool::new(false),
+            active: AtomicBool::new(true),
             hw_mask: AtomicU32::new(0),
             sw_mask: AtomicU32::new(0),
             nest: AtomicUsize::new(0),
