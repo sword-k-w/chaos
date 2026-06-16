@@ -232,11 +232,11 @@ impl KernLock {
         if (d == 0) {
             return;
         }
-        self.holder.store(0, Ordering::Relaxed);
-        self.holder_id.store(0, Ordering::Relaxed);
         self.depth.store(d - 1, Ordering::Relaxed);
         if (d == 1) {
             self.flag.store(false, Ordering::Release);
+            self.holder.store(0, Ordering::Relaxed);
+            self.holder_id.store(0, Ordering::Relaxed);
         }
     }
     pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
