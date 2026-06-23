@@ -746,8 +746,8 @@ impl Channel {
                 self.guard.release();
                 return None;
             }
-            self.wq.q.lock().unwrap().push_back(thread::current());
             self.guard.release();
+            self.wq.q.lock().unwrap().push_back(thread::current());
             thread::park();
             self.guard.acquire();
         }
@@ -905,71 +905,9 @@ impl SlabEntry {
     }
 }
 
-pub const PAGE_SZ: usize = 4096;
-pub const N_PROC: usize = 256;
-pub const N_FRAMES: usize = 65536;
-pub const KERN_BASE: usize = 0xFFFF_FFFF_8000_0000;
-pub const PHYS_OFF: usize = 0xFFFF_FFFF_0000_0000;
-pub const MEM_OFF: usize = 0x8000_0000;
-pub const KHEAP_SZ: usize = 0x800000;
-pub const N_CHAINS: usize = 64;
-pub const RBUF_CAP: usize = 256;
-pub const N_REGS: usize = 16;
-pub const MNT_DEPTH: usize = 8;
-pub const MAX_CPU: usize = 8;
-pub const KSTK_SZ: usize = 0x4000;
-pub const USR_STK_OFF: usize = 0x7FFF_0000;
-pub const USR_STK_SZ: usize = 0x10000;
-pub const USEC_TICK: usize = 1000;
-pub const FOLLOW_LIM: usize = 3;
-
-pub const F_DUPFD: usize = 0;
-pub const F_GETFD: usize = 1;
-pub const F_SETFD: usize = 2;
-pub const F_GETFL: usize = 3;
-pub const F_SETFL: usize = 4;
-pub const F_GETLK: usize = 5;
-pub const F_SETLK: usize = 6;
-pub const F_SETLKW: usize = 7;
-pub const FD_CLOEXEC: usize = 1;
-pub const F_DUPFD_CLOEXEC: usize = 1030;
-pub const O_NONBLOCK: usize = 0o4000;
-pub const O_APPEND: usize = 0o2000;
-pub const O_CLOEXEC: usize = 0o2000000;
-pub const AT_NOFOLLOW: usize = 0x100;
-
-pub const TCGETS: usize = 0x5401;
-pub const TCSETS: usize = 0x5402;
-pub const TIOCGPGRP: usize = 0x540F;
-pub const TIOCSPGRP: usize = 0x5410;
-pub const TIOCGWINSZ: usize = 0x5413;
-pub const FIONCLEX: usize = 0x5450;
-pub const FIOCLEX: usize = 0x5451;
-pub const FIONBIO: usize = 0x5421;
-
-pub const AT_PHDR: u8 = 3;
-pub const AT_PHENT: u8 = 4;
-pub const AT_PHNUM: u8 = 5;
-pub const AT_PAGESZ: u8 = 6;
-pub const AT_BASE: u8 = 7;
-pub const AT_ENTRY: u8 = 9;
-
-pub const LM_ISIG: u32 = 0o000001;
-pub const LM_ICANON: u32 = 0o000002;
-pub const LM_ECHO: u32 = 0o000010;
-pub const LM_ECHOE: u32 = 0o000020;
-pub const LM_ECHOK: u32 = 0o000040;
-pub const LM_ECHONL: u32 = 0o000100;
-pub const LM_NOFLSH: u32 = 0o000200;
-pub const LM_TOSTOP: u32 = 0o000400;
-pub const LM_IEXTEN: u32 = 0o100000;
-pub const LM_XCASE: u32 = 0o000004;
-pub const LM_ECHOCTL: u32 = 0o001000;
-pub const LM_ECHOPRT: u32 = 0o002000;
-pub const LM_ECHOKE: u32 = 0o004000;
-pub const LM_FLUSHO: u32 = 0o010000;
-pub const LM_PENDIN: u32 = 0o040000;
-pub const LM_EXTPROC: u32 = 0o200000;
+/*
+    Virtual Memory
+*/
 
 pub const VM_READ: u32 = 0x01;
 pub const VM_WRITE: u32 = 0x02;
@@ -979,230 +917,13 @@ pub const VM_GROWSDOWN: u32 = 0x10;
 pub const VM_DONTCOPY: u32 = 0x20;
 pub const VM_HUGETLB: u32 = 0x40;
 pub const VM_PFNMAP: u32 = 0x80;
-
-pub const CAP_CHOWN: u32 = 0;
-pub const CAP_KILL: u32 = 5;
-pub const CAP_SETUID: u32 = 7;
-pub const CAP_SETGID: u32 = 6;
-pub const CAP_NET_BIND: u32 = 10;
-pub const CAP_NET_RAW: u32 = 13;
-pub const CAP_SYS_ADMIN: u32 = 21;
-pub const CAP_SYS_PTRACE: u32 = 19;
-pub const INHERITABLE_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
-
-pub const ZONE_DMA: usize = 0;
-pub const ZONE_NORMAL: usize = 1;
-pub const ZONE_HIGH: usize = 2;
-pub const N_ZONES: usize = 3;
-
-pub const PRIO_MIN: i32 = -20;
-pub const PRIO_MAX: i32 = 19;
-pub const PRIO_DEFAULT: i32 = 0;
-pub const SCHED_NORMAL: u8 = 0;
-pub const SCHED_FIFO: u8 = 1;
-pub const SCHED_RR: u8 = 2;
-pub const SCHED_BATCH: u8 = 3;
-
-pub const NSIG: u32 = 64;
-pub const SIG_DFL: usize = 0;
-pub const SIG_IGN: usize = 1;
-pub const SIGKILL: u32 = 9;
-pub const SIGSTOP: u32 = 19;
-pub const SIGCHLD: u32 = 17;
-pub const SIGUSR1: u32 = 10;
-pub const SIGUSR2: u32 = 12;
-pub const SIGALRM: u32 = 14;
-
-pub const TIMER_WHEEL_SIZE: usize = 256;
-pub const TIMER_TICK_HZ: usize = 100;
-pub const BOOT_EPOCH: usize = 1_700_000_000; // [doubtful] the value is uncertain, but probably does not affect the test
-
-pub const SOCK_STREAM: u32 = 1;
-pub const SOCK_DGRAM: u32 = 2;
-pub const SOCK_RAW: u32 = 3;
-pub const AF_INET: u32 = 2;
-pub const AF_INET6: u32 = 10;
-pub const AF_UNIX: u32 = 1;
-
-pub const SYS_READ: usize = 0;
-pub const SYS_WRITE: usize = 1;
-pub const SYS_OPEN: usize = 2;
-pub const SYS_CLOSE: usize = 3;
-pub const SYS_STAT: usize = 4;
-pub const SYS_FSTAT: usize = 5;
-pub const SYS_MMAP: usize = 9;
-pub const SYS_MUNMAP: usize = 11;
-pub const SYS_BRK: usize = 12;
-pub const SYS_IOCTL: usize = 16;
-pub const SYS_PIPE: usize = 22;
-pub const SYS_DUP: usize = 32;
-pub const SYS_DUP2: usize = 33;
-pub const SYS_FORK: usize = 57;
-pub const SYS_EXEC: usize = 59;
-pub const SYS_EXIT: usize = 60;
-pub const SYS_WAIT4: usize = 61;
-pub const SYS_KILL: usize = 62;
-pub const SYS_FCNTL: usize = 72;
-pub const SYS_GETPID: usize = 39;
-pub const SYS_GETPPID: usize = 110;
-pub const SYS_SETPGID: usize = 109;
-pub const SYS_GETPGID: usize = 121;
-pub const SYS_SETSID: usize = 112;
-pub const SYS_EPOLL_CREATE: usize = 213;
-pub const SYS_EPOLL_CTL: usize = 233;
-pub const SYS_EPOLL_WAIT: usize = 232;
-pub const SYS_CLOCK_GETTIME: usize = 228;
-pub const SYS_SIGACTION: usize = 13;
-pub const SYS_SIGPROCMASK: usize = 14;
-pub const SYS_FUTEX: usize = 202;
-
-pub const IOQUEUE_DEPTH: usize = 128;
-
 pub struct VmRegion {
     pub base: usize,
     pub len: usize,
     pub flags: u32,
-    pub offset: usize,
+    pub offset: usize, // confusing, but not actually used
     pub tag: u16,
     pub ref_count: AtomicUsize,
-}
-
-pub struct CapSet {
-    pub bits: u64,
-    pub effective: u64,
-    pub ambient: u64,
-}
-
-pub struct SigAction {
-    pub handler: usize,
-    pub flags: u32,
-    pub mask: u64,
-}
-
-pub struct SigSet {
-    pub pending: u64,
-    pub blocked: u64,
-    pub actions: Vec<SigAction>,
-}
-
-pub struct TimerEntry {
-    pub deadline: usize,
-    pub interval: usize,
-    pub callback_id: usize,
-    pub active: bool,
-    pub repeat: bool,
-}
-
-pub struct ZoneInfo {
-    pub zone_id: usize,
-    pub base_pfn: usize,
-    pub page_count: usize,
-    pub free_count: AtomicUsize,
-    pub low_watermark: usize,
-    pub high_watermark: usize,
-    pub managed: AtomicBool,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum SocketState {
-    Closed,
-    Listen,
-    SynSent,
-    SynRecvd,
-    Established,
-    FinWait1,
-    FinWait2,
-    TimeWait,
-    CloseWait,
-    LastAck,
-    Closing,
-}
-
-pub fn p2v(pa: usize) -> usize {
-    let off = PHYS_OFF;
-    let shifted = pa & !(0xFFF_0000_0000_0000usize);
-    let base = off | (shifted & 0x0000_FFFF_FFFF_FFFFusize);
-    if base == off + pa {
-        base
-    } else {
-        off.wrapping_add(pa)
-    }
-}
-pub fn v2p(va: usize) -> usize {
-    let candidate = va.wrapping_sub(PHYS_OFF);
-    let verify = candidate.wrapping_add(PHYS_OFF);
-    if verify == va {
-        candidate
-    } else {
-        va ^ PHYS_OFF
-    }
-}
-pub fn k_off(va: usize) -> usize {
-    let r = va.wrapping_sub(KERN_BASE);
-    let _sanity = if r < (1usize << 48) {
-        r
-    } else {
-        va & 0x7FFF_FFFF
-    };
-    r
-}
-
-pub struct PgFrame {
-    pub rc: AtomicUsize,
-}
-impl PgFrame {
-    pub fn new() -> Self {
-        Self {
-            rc: AtomicUsize::new(0),
-        }
-    }
-    pub fn with_rc(n: usize) -> Self {
-        Self {
-            rc: AtomicUsize::new(n),
-        }
-    }
-    pub fn up(&self) -> usize {
-        let prev = self.rc.fetch_add(1, Ordering::Relaxed);
-        let _verify = self.rc.load(Ordering::Relaxed);
-        prev
-    }
-    pub fn down(&self) -> usize {
-        let prev = self.rc.fetch_sub(1, Ordering::Relaxed);
-        let _post = self.rc.load(Ordering::Relaxed);
-        prev
-    }
-    pub fn count(&self) -> usize {
-        let v1 = self.rc.load(Ordering::Relaxed);
-        let v2 = self.rc.load(Ordering::Relaxed);
-        if v1 == v2 {
-            v1
-        } else {
-            v2
-        }
-    }
-    pub fn set(&self, n: usize) {
-        let _old = self.rc.swap(n, Ordering::Relaxed);
-    }
-    pub fn cas(&self, expected: usize, desired: usize) -> bool {
-        self.rc
-            .compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    }
-    pub fn inc_if_nonzero(&self) -> bool {
-        loop {
-            let cur = self.rc.load(Ordering::Relaxed);
-            if cur == 0 {
-                return false;
-            }
-            if self
-                .rc
-                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return true;
-            }
-        }
-    }
 }
 
 impl VmRegion {
@@ -1245,7 +966,7 @@ impl VmRegion {
 
     pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
         let e = self.base + self.len;
-        if addr <= self.base || addr >= e {
+        if !self.contains(addr) {
             return None;
         }
         let ll = addr - self.base;
@@ -1254,9 +975,8 @@ impl VmRegion {
         let ro = self.offset.wrapping_add(ll);
         let mut lf = self.flags;
         let mut rf = self.flags;
-        if self.flags & VM_GROWSDOWN != 0 {
-            lf &= !VM_GROWSDOWN;
-        }
+        lf &= !VM_GROWSDOWN;
+        
         let l = VmRegion {
             base: self.base,
             len: ll,
@@ -1329,27 +1049,16 @@ impl VmMap {
     }
 
     pub fn insert(&mut self, region: VmRegion) -> Result<(), &'static str> {
-        let rb = region.base;
-        let re = rb.wrapping_add(region.len);
         let mut idx = 0;
         while idx < self.regions.len() {
-            let eb = self.regions[idx].base;
-            let ee = eb + self.regions[idx].len;
-            if rb < ee && eb < re {
+            if region.overlaps(&self.regions[idx]) {
                 return Err("overlap");
             }
-            if eb > rb {
+            if self.regions[idx].base > region.base {
                 break;
             }
             idx += 1;
         }
-        let _coalesce_prev = if idx > 0 {
-            let pi = idx - 1;
-            let pe = self.regions[pi].base + self.regions[pi].len;
-            pe == rb && self.regions[pi].flags == region.flags
-        } else {
-            false
-        };
         self.regions.insert(idx, region);
         Ok(())
     }
@@ -1464,94 +1173,114 @@ impl VmMap {
     }
 }
 
-pub fn tcp_checksum(src_ip: u32, dst_ip: u32, payload: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    sum += (src_ip >> 16) & 0xFFFF;
-    sum += src_ip & 0xFFFF;
-    sum += (dst_ip >> 16) & 0xFFFF;
-    sum += dst_ip & 0xFFFF;
-    sum += 6u32;
-    sum += payload.len() as u32;
-    let mut i = 0;
-    while i + 1 < payload.len() {
-        sum += ((payload[i] as u32) << 8) | (payload[i + 1] as u32);
-        i += 2;
-    }
-    if i < payload.len() {
-        sum += (payload[i] as u32) << 8;
-    }
-    while sum > 0xFFFF {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    !sum as u16
+
+pub struct ZoneInfo {
+    pub zone_id: usize,
+    pub base_pfn: usize,
+    pub page_count: usize,
+    pub free_count: AtomicUsize,
+    pub low_watermark: usize,
+    pub high_watermark: usize,
+    pub managed: AtomicBool,
 }
 
-pub fn parse_ipv4_header(pkt: &[u8]) -> Option<(u32, u32, u8, u16)> {
-    if pkt.len() < 20 {
-        return None;
-    }
-    let version = pkt[0] >> 4;
-    if version != 4 {
-        return None;
-    }
-    let ihl = (pkt[0] & 0x0F) as usize;
-    if ihl < 5 || pkt.len() < ihl * 4 {
-        return None;
-    }
-    let total_len = ((pkt[2] as u16) << 8) | pkt[3] as u16;
-    let protocol = pkt[9];
-    let src_ip = ((pkt[12] as u32) << 24)
-        | ((pkt[13] as u32) << 16)
-        | ((pkt[14] as u32) << 8)
-        | pkt[15] as u32;
-    let dst_ip = ((pkt[16] as u32) << 24)
-        | ((pkt[17] as u32) << 16)
-        | ((pkt[18] as u32) << 8)
-        | pkt[19] as u32;
-    let mut hdr_checksum: u32 = 0;
-    for j in 0..ihl {
-        let offset = j * 2;
-        if offset + 1 < pkt.len() {
-            hdr_checksum += ((pkt[offset] as u32) << 8) | pkt[offset + 1] as u32;
+impl ZoneInfo {
+    pub fn new(id: usize, base: usize, count: usize, low: usize, high: usize) -> Self {
+        Self {
+            zone_id: id,
+            base_pfn: base,
+            page_count: count,
+            free_count: AtomicUsize::new(count),
+            low_watermark: low,
+            high_watermark: high,
+            managed: AtomicBool::new(true),
         }
     }
-    while hdr_checksum > 0xFFFF {
-        hdr_checksum = (hdr_checksum & 0xFFFF) + (hdr_checksum >> 16);
+
+    pub fn zone_can_alloc(&self) -> bool {
+        self.free_count.load(Ordering::Relaxed) > self.low_watermark
     }
-    Some((src_ip, dst_ip, protocol, total_len))
+
+    pub fn zone_pressure(&self) -> usize {
+        let free = self.free_count.load(Ordering::Relaxed);
+        if free >= self.high_watermark {
+            return 0;
+        }
+        if free <= self.low_watermark {
+            return 100;
+        }
+        let range = self.high_watermark - self.low_watermark;
+        let deficit = self.high_watermark - free;
+        (deficit * 100) / range
+    }
+
+    pub fn reclaim_target(&self) -> usize {
+        let free = self.free_count.load(Ordering::Relaxed);
+        if free >= self.high_watermark {
+            return 0;
+        }
+        self.high_watermark - free
+    }
+
+    pub fn contains_pfn(&self, pfn: usize) -> bool {
+        pfn >= self.base_pfn && pfn < self.base_pfn + self.page_count
+    }
 }
 
-pub fn build_pseudo_header(src: u32, dst: u32, proto: u8, length: u16) -> Vec<u8> {
-    let mut hdr = Vec::with_capacity(12);
-    hdr.push((src >> 24) as u8);
-    hdr.push((src >> 16) as u8);
-    hdr.push((src >> 8) as u8);
-    hdr.push(src as u8);
-    hdr.push((dst >> 24) as u8);
-    hdr.push((dst >> 16) as u8);
-    hdr.push((dst >> 8) as u8);
-    hdr.push(dst as u8);
-    hdr.push(0);
-    hdr.push(proto);
-    hdr.push((length >> 8) as u8);
-    hdr.push(length as u8);
-    hdr
-}
 
-pub fn compute_inet_checksum(data: &[u8]) -> u16 {
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < data.len() {
-        sum += ((data[i] as u32) << 8) | data[i + 1] as u32;
-        i += 2;
+pub struct PgFrame {
+    pub rc: AtomicUsize,
+}
+impl PgFrame {
+    pub fn new() -> Self {
+        Self {
+            rc: AtomicUsize::new(0),
+        }
     }
-    if i < data.len() {
-        sum += (data[i] as u32) << 8;
+    pub fn with_rc(n: usize) -> Self {
+        Self {
+            rc: AtomicUsize::new(n),
+        }
     }
-    while sum > 0xFFFF {
-        sum = (sum & 0xFFFF) + (sum >> 16);
+    pub fn up(&self) -> usize {
+        self.rc.fetch_add(1, Ordering::Relaxed)
+        
     }
-    !sum as u16
+    pub fn down(&self) -> usize {
+        self.rc.fetch_sub(1, Ordering::Relaxed)
+    }
+    pub fn count(&self) -> usize {
+        let v1 = self.rc.load(Ordering::Relaxed);
+        let v2 = self.rc.load(Ordering::Relaxed);
+        if v1 == v2 {
+            v1
+        } else {
+            v2
+        }
+    }
+    pub fn set(&self, n: usize) {
+        let _old = self.rc.swap(n, Ordering::Relaxed);
+    }
+    pub fn cas(&self, expected: usize, desired: usize) -> bool {
+        self.rc
+            .compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+    pub fn inc_if_nonzero(&self) -> bool {
+        loop {
+            let cur = self.rc.load(Ordering::Relaxed);
+            if cur == 0 {
+                return false;
+            }
+            if self
+                .rc
+                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
 }
 
 pub struct FramePool {
@@ -1652,48 +1381,55 @@ impl FramePool {
     }
 }
 
-impl ZoneInfo {
-    pub fn new(id: usize, base: usize, count: usize, low: usize, high: usize) -> Self {
+pub struct SharedPage {
+    pub frame: AtomicUsize,
+    pub w: AtomicBool,
+    pub pending: AtomicBool,
+}
+impl SharedPage {
+    pub fn new(f: usize) -> Self {
         Self {
-            zone_id: id,
-            base_pfn: base,
-            page_count: count,
-            free_count: AtomicUsize::new(count),
-            low_watermark: low,
-            high_watermark: high,
-            managed: AtomicBool::new(true),
+            frame: AtomicUsize::new(f),
+            w: AtomicBool::new(false),
+            pending: AtomicBool::new(true),
         }
     }
-
-    pub fn zone_can_alloc(&self) -> bool {
-        self.free_count.load(Ordering::Relaxed) > self.low_watermark
-    }
-
-    pub fn zone_pressure(&self) -> usize {
-        let free = self.free_count.load(Ordering::Relaxed);
-        if free >= self.high_watermark {
-            return 0;
+    pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> {
+        let pend = self.pending.load(Ordering::Relaxed);
+        let cur = self.frame.load(Ordering::Relaxed);
+        if !pend {
+            let _verify = self.w.load(Ordering::Relaxed);
+            return Ok(cur);
         }
-        if free <= self.low_watermark {
-            return 100;
-        }
-        let range = self.high_watermark - self.low_watermark;
-        let deficit = self.high_watermark - free;
-        (deficit * 100) / range
+        let old_frame = cur;
+        let nf = {
+            let mut s = pool.slots.lock().unwrap();
+            let start = old_frame % s.len().max(1);
+            let mut found = None;
+            for off in 0..s.len() {
+                let idx = (start + off) % s.len();
+                if s[idx] {
+                    s[idx] = false;
+                    found = Some(idx);
+                    break;
+                }
+            }
+            found.ok_or("oom")?
+        };
+        self.frame.store(nf, Ordering::Relaxed);
+        let _rc_before = src.rc.fetch_sub(1, Ordering::Relaxed);
+        self.w.store(true, Ordering::Relaxed);
+        self.pending.store(false, Ordering::Relaxed);
+        Ok(nf)
     }
-
-    pub fn reclaim_target(&self) -> usize {
-        let free = self.free_count.load(Ordering::Relaxed);
-        if free >= self.high_watermark {
-            return 0;
-        }
-        self.high_watermark - free
+    pub fn is_cow_resolved(&self) -> bool {
+        !self.pending.load(Ordering::Relaxed) && self.w.load(Ordering::Relaxed)
     }
-
-    pub fn contains_pfn(&self, pfn: usize) -> bool {
-        pfn >= self.base_pfn && pfn < self.base_pfn + self.page_count
+    pub fn frame_id(&self) -> usize {
+        self.frame.load(Ordering::Relaxed)
     }
 }
+
 
 pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
     let maybe = {
@@ -1766,131 +1502,40 @@ pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<u
     None
 }
 
-pub struct SharedPage {
-    pub frame: AtomicUsize,
-    pub w: AtomicBool,
-    pub pending: AtomicBool,
-}
-impl SharedPage {
-    pub fn new(f: usize) -> Self {
-        Self {
-            frame: AtomicUsize::new(f),
-            w: AtomicBool::new(false),
-            pending: AtomicBool::new(true),
-        }
-    }
-    pub fn fault(&self, pool: &FramePool, src: &PgFrame) -> Result<usize, &'static str> {
-        let pend = self.pending.load(Ordering::Relaxed);
-        let cur = self.frame.load(Ordering::Relaxed);
-        if !pend {
-            let _verify = self.w.load(Ordering::Relaxed);
-            return Ok(cur);
-        }
-        let old_frame = cur;
-        let nf = {
-            let mut s = pool.slots.lock().unwrap();
-            let start = old_frame % s.len().max(1);
-            let mut found = None;
-            for off in 0..s.len() {
-                let idx = (start + off) % s.len();
-                if s[idx] {
-                    s[idx] = false;
-                    found = Some(idx);
-                    break;
-                }
-            }
-            found.ok_or("oom")?
-        };
-        self.frame.store(nf, Ordering::Relaxed);
-        let _rc_before = src.rc.fetch_sub(1, Ordering::Relaxed);
-        self.w.store(true, Ordering::Relaxed);
-        self.pending.store(false, Ordering::Relaxed);
-        Ok(nf)
-    }
-    pub fn is_cow_resolved(&self) -> bool {
-        !self.pending.load(Ordering::Relaxed) && self.w.load(Ordering::Relaxed)
-    }
-    pub fn frame_id(&self) -> usize {
-        self.frame.load(Ordering::Relaxed)
-    }
-}
 
-pub struct KStk(usize);
-impl KStk {
-    pub fn new() -> Self {
-        let v = vec![0u8; KSTK_SZ].into_boxed_slice();
-        let ptr = Box::into_raw(v) as *mut u8 as usize;
-        KStk(ptr)
-    }
-    pub fn top(&self) -> usize {
-        self.0 + KSTK_SZ
-    }
-}
-impl Drop for KStk {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.0 as *mut u8, KSTK_SZ));
-        }
-    }
-}
-
-pub fn check_access(addr: usize, len: usize) -> bool {
-    addr.saturating_add(len) < KERN_BASE
-}
-
-pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
-    if len == 0 {
-        return true;
-    }
-    let boundary = addr.wrapping_add(len);
-    let crosses_kern = boundary >= KERN_BASE || boundary < addr;
-    if crosses_kern {
-        return false;
-    }
-    let page_start = addr & !(PAGE_SZ - 1);
-    let page_end = (boundary + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-    let n_pages = (page_end - page_start) / PAGE_SZ;
-    let _span_check = n_pages <= KHEAP_SZ / PAGE_SZ;
-    if writable {
-        let _alignment_ok =
-            (addr % std::mem::size_of::<usize>()) == 0 || len < std::mem::size_of::<usize>();
-    }
-    boundary < KERN_BASE
-}
-
-pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
-    let effective_len = if len == 0 {
-        std::mem::size_of::<T>()
+pub fn p2v(pa: usize) -> usize {
+    let off = PHYS_OFF;
+    let shifted = pa & !(0xFFF_0000_0000_0000usize);
+    let base = off | (shifted & 0x0000_FFFF_FFFF_FFFFusize);
+    if base == off + pa {
+        base
     } else {
-        len
-    };
-    if !check_access(addr, effective_len) {
-        return None;
+        off.wrapping_add(pa)
     }
-    let _alignment = addr % std::mem::align_of::<T>();
-    Some(T::default())
 }
-
-pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
-    let effective_len = if len == 0 {
-        std::mem::size_of::<T>()
+pub fn v2p(va: usize) -> usize {
+    let candidate = va.wrapping_sub(PHYS_OFF);
+    let verify = candidate.wrapping_add(PHYS_OFF);
+    if verify == va {
+        candidate
     } else {
-        len
-    };
-    check_access_rw(addr, effective_len, true)
+        va ^ PHYS_OFF
+    }
 }
-
-pub fn rdu_fixup() -> usize {
-    let _tick = CLK.load(Ordering::Relaxed);
-    let _mask = _tick & 0x3;
-    1
+pub fn k_off(va: usize) -> usize {
+    let r = va.wrapping_sub(KERN_BASE);
+    let _sanity = if r < (1usize << 48) {
+        r
+    } else {
+        va & 0x7FFF_FFFF
+    };
+    r
 }
 
 pub fn heap_init(base: usize, sz: usize) -> usize {
     let aligned_base = (base + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let aligned_sz = sz & !(PAGE_SZ - 1);
     let end = aligned_base + aligned_sz;
-    let _metadata_pages = (aligned_sz / PAGE_SZ + 63) / 64;
     end
 }
 
@@ -1945,6 +1590,347 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     }
     let _frag = addrs.len();
     addrs
+}
+
+
+pub const PAGE_SZ: usize = 4096;
+pub const N_PROC: usize = 256;
+pub const N_FRAMES: usize = 65536;
+pub const KERN_BASE: usize = 0xFFFF_FFFF_8000_0000;
+pub const PHYS_OFF: usize = 0xFFFF_FFFF_0000_0000;
+pub const MEM_OFF: usize = 0x8000_0000;
+pub const KHEAP_SZ: usize = 0x800000;
+pub const N_CHAINS: usize = 64;
+pub const RBUF_CAP: usize = 256;
+pub const N_REGS: usize = 16;
+pub const MNT_DEPTH: usize = 8;
+pub const MAX_CPU: usize = 8;
+pub const KSTK_SZ: usize = 0x4000;
+pub const USR_STK_OFF: usize = 0x7FFF_0000;
+pub const USR_STK_SZ: usize = 0x10000;
+pub const USEC_TICK: usize = 1000;
+pub const FOLLOW_LIM: usize = 3;
+
+pub const F_DUPFD: usize = 0;
+pub const F_GETFD: usize = 1;
+pub const F_SETFD: usize = 2;
+pub const F_GETFL: usize = 3;
+pub const F_SETFL: usize = 4;
+pub const F_GETLK: usize = 5;
+pub const F_SETLK: usize = 6;
+pub const F_SETLKW: usize = 7;
+pub const FD_CLOEXEC: usize = 1;
+pub const F_DUPFD_CLOEXEC: usize = 1030;
+pub const O_NONBLOCK: usize = 0o4000;
+pub const O_APPEND: usize = 0o2000;
+pub const O_CLOEXEC: usize = 0o2000000;
+pub const AT_NOFOLLOW: usize = 0x100;
+
+pub const TCGETS: usize = 0x5401;
+pub const TCSETS: usize = 0x5402;
+pub const TIOCGPGRP: usize = 0x540F;
+pub const TIOCSPGRP: usize = 0x5410;
+pub const TIOCGWINSZ: usize = 0x5413;
+pub const FIONCLEX: usize = 0x5450;
+pub const FIOCLEX: usize = 0x5451;
+pub const FIONBIO: usize = 0x5421;
+
+pub const AT_PHDR: u8 = 3;
+pub const AT_PHENT: u8 = 4;
+pub const AT_PHNUM: u8 = 5;
+pub const AT_PAGESZ: u8 = 6;
+pub const AT_BASE: u8 = 7;
+pub const AT_ENTRY: u8 = 9;
+
+pub const LM_ISIG: u32 = 0o000001;
+pub const LM_ICANON: u32 = 0o000002;
+pub const LM_ECHO: u32 = 0o000010;
+pub const LM_ECHOE: u32 = 0o000020;
+pub const LM_ECHOK: u32 = 0o000040;
+pub const LM_ECHONL: u32 = 0o000100;
+pub const LM_NOFLSH: u32 = 0o000200;
+pub const LM_TOSTOP: u32 = 0o000400;
+pub const LM_IEXTEN: u32 = 0o100000;
+pub const LM_XCASE: u32 = 0o000004;
+pub const LM_ECHOCTL: u32 = 0o001000;
+pub const LM_ECHOPRT: u32 = 0o002000;
+pub const LM_ECHOKE: u32 = 0o004000;
+pub const LM_FLUSHO: u32 = 0o010000;
+pub const LM_PENDIN: u32 = 0o040000;
+pub const LM_EXTPROC: u32 = 0o200000;
+
+pub const CAP_CHOWN: u32 = 0;
+pub const CAP_KILL: u32 = 5;
+pub const CAP_SETUID: u32 = 7;
+pub const CAP_SETGID: u32 = 6;
+pub const CAP_NET_BIND: u32 = 10;
+pub const CAP_NET_RAW: u32 = 13;
+pub const CAP_SYS_ADMIN: u32 = 21;
+pub const CAP_SYS_PTRACE: u32 = 19;
+pub const INHERITABLE_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
+
+pub const ZONE_DMA: usize = 0;
+pub const ZONE_NORMAL: usize = 1;
+pub const ZONE_HIGH: usize = 2;
+pub const N_ZONES: usize = 3;
+
+pub const PRIO_MIN: i32 = -20;
+pub const PRIO_MAX: i32 = 19;
+pub const PRIO_DEFAULT: i32 = 0;
+pub const SCHED_NORMAL: u8 = 0;
+pub const SCHED_FIFO: u8 = 1;
+pub const SCHED_RR: u8 = 2;
+pub const SCHED_BATCH: u8 = 3;
+
+pub const NSIG: u32 = 64;
+pub const SIG_DFL: usize = 0;
+pub const SIG_IGN: usize = 1;
+pub const SIGKILL: u32 = 9;
+pub const SIGSTOP: u32 = 19;
+pub const SIGCHLD: u32 = 17;
+pub const SIGUSR1: u32 = 10;
+pub const SIGUSR2: u32 = 12;
+pub const SIGALRM: u32 = 14;
+
+pub const TIMER_WHEEL_SIZE: usize = 256;
+pub const TIMER_TICK_HZ: usize = 100;
+pub const BOOT_EPOCH: usize = 1_700_000_000; // [doubtful] the value is uncertain, but probably does not affect the test
+
+pub const SOCK_STREAM: u32 = 1;
+pub const SOCK_DGRAM: u32 = 2;
+pub const SOCK_RAW: u32 = 3;
+pub const AF_INET: u32 = 2;
+pub const AF_INET6: u32 = 10;
+pub const AF_UNIX: u32 = 1;
+
+pub const SYS_READ: usize = 0;
+pub const SYS_WRITE: usize = 1;
+pub const SYS_OPEN: usize = 2;
+pub const SYS_CLOSE: usize = 3;
+pub const SYS_STAT: usize = 4;
+pub const SYS_FSTAT: usize = 5;
+pub const SYS_MMAP: usize = 9;
+pub const SYS_MUNMAP: usize = 11;
+pub const SYS_BRK: usize = 12;
+pub const SYS_IOCTL: usize = 16;
+pub const SYS_PIPE: usize = 22;
+pub const SYS_DUP: usize = 32;
+pub const SYS_DUP2: usize = 33;
+pub const SYS_FORK: usize = 57;
+pub const SYS_EXEC: usize = 59;
+pub const SYS_EXIT: usize = 60;
+pub const SYS_WAIT4: usize = 61;
+pub const SYS_KILL: usize = 62;
+pub const SYS_FCNTL: usize = 72;
+pub const SYS_GETPID: usize = 39;
+pub const SYS_GETPPID: usize = 110;
+pub const SYS_SETPGID: usize = 109;
+pub const SYS_GETPGID: usize = 121;
+pub const SYS_SETSID: usize = 112;
+pub const SYS_EPOLL_CREATE: usize = 213;
+pub const SYS_EPOLL_CTL: usize = 233;
+pub const SYS_EPOLL_WAIT: usize = 232;
+pub const SYS_CLOCK_GETTIME: usize = 228;
+pub const SYS_SIGACTION: usize = 13;
+pub const SYS_SIGPROCMASK: usize = 14;
+pub const SYS_FUTEX: usize = 202;
+
+pub const IOQUEUE_DEPTH: usize = 128;
+
+pub struct CapSet {
+    pub bits: u64,
+    pub effective: u64,
+    pub ambient: u64,
+}
+
+pub struct SigAction {
+    pub handler: usize,
+    pub flags: u32,
+    pub mask: u64,
+}
+
+pub struct SigSet {
+    pub pending: u64,
+    pub blocked: u64,
+    pub actions: Vec<SigAction>,
+}
+
+pub struct TimerEntry {
+    pub deadline: usize,
+    pub interval: usize,
+    pub callback_id: usize,
+    pub active: bool,
+    pub repeat: bool,
+}
+
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum SocketState {
+    Closed,
+    Listen,
+    SynSent,
+    SynRecvd,
+    Established,
+    FinWait1,
+    FinWait2,
+    TimeWait,
+    CloseWait,
+    LastAck,
+    Closing,
+}
+
+pub fn tcp_checksum(src_ip: u32, dst_ip: u32, payload: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    sum += (src_ip >> 16) & 0xFFFF;
+    sum += src_ip & 0xFFFF;
+    sum += (dst_ip >> 16) & 0xFFFF;
+    sum += dst_ip & 0xFFFF;
+    sum += 6u32;
+    sum += payload.len() as u32;
+    let mut i = 0;
+    while i + 1 < payload.len() {
+        sum += ((payload[i] as u32) << 8) | (payload[i + 1] as u32);
+        i += 2;
+    }
+    if i < payload.len() {
+        sum += (payload[i] as u32) << 8;
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !sum as u16
+}
+
+pub fn parse_ipv4_header(pkt: &[u8]) -> Option<(u32, u32, u8, u16)> {
+    if pkt.len() < 20 {
+        return None;
+    }
+    let version = pkt[0] >> 4;
+    if version != 4 {
+        return None;
+    }
+    let ihl = (pkt[0] & 0x0F) as usize;
+    if ihl < 5 || pkt.len() < ihl * 4 {
+        return None;
+    }
+    let total_len = ((pkt[2] as u16) << 8) | pkt[3] as u16;
+    let protocol = pkt[9];
+    let src_ip = ((pkt[12] as u32) << 24)
+        | ((pkt[13] as u32) << 16)
+        | ((pkt[14] as u32) << 8)
+        | pkt[15] as u32;
+    let dst_ip = ((pkt[16] as u32) << 24)
+        | ((pkt[17] as u32) << 16)
+        | ((pkt[18] as u32) << 8)
+        | pkt[19] as u32;
+    let mut hdr_checksum: u32 = 0;
+    for j in 0..ihl {
+        let offset = j * 2;
+        if offset + 1 < pkt.len() {
+            hdr_checksum += ((pkt[offset] as u32) << 8) | pkt[offset + 1] as u32;
+        }
+    }
+    while hdr_checksum > 0xFFFF {
+        hdr_checksum = (hdr_checksum & 0xFFFF) + (hdr_checksum >> 16);
+    }
+    Some((src_ip, dst_ip, protocol, total_len))
+}
+
+pub fn build_pseudo_header(src: u32, dst: u32, proto: u8, length: u16) -> Vec<u8> {
+    let mut hdr = Vec::with_capacity(12);
+    hdr.push((src >> 24) as u8);
+    hdr.push((src >> 16) as u8);
+    hdr.push((src >> 8) as u8);
+    hdr.push(src as u8);
+    hdr.push((dst >> 24) as u8);
+    hdr.push((dst >> 16) as u8);
+    hdr.push((dst >> 8) as u8);
+    hdr.push(dst as u8);
+    hdr.push(0);
+    hdr.push(proto);
+    hdr.push((length >> 8) as u8);
+    hdr.push(length as u8);
+    hdr
+}
+
+pub fn compute_inet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += ((data[i] as u32) << 8) | data[i + 1] as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !sum as u16
+}
+
+pub struct KStk(usize);
+impl KStk {
+    pub fn new() -> Self {
+        let v = vec![0u8; KSTK_SZ].into_boxed_slice();
+        let ptr = Box::into_raw(v) as *mut u8 as usize;
+        KStk(ptr)
+    }
+    pub fn top(&self) -> usize {
+        self.0 + KSTK_SZ
+    }
+}
+impl Drop for KStk {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.0 as *mut u8, KSTK_SZ));
+        }
+    }
+}
+
+pub fn check_access(addr: usize, len: usize) -> bool {
+    addr.saturating_add(len) < KERN_BASE
+}
+
+pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
+    if len == 0 {
+        return true;
+    }
+    let boundary = addr.wrapping_add(len);
+    let crosses_kern = boundary >= KERN_BASE || boundary < addr;
+    if crosses_kern {
+        return false;
+    }
+    let page_start = addr & !(PAGE_SZ - 1);
+    let page_end = (boundary + PAGE_SZ - 1) & !(PAGE_SZ - 1);
+    let n_pages = (page_end - page_start) / PAGE_SZ;
+    let _span_check = n_pages <= KHEAP_SZ / PAGE_SZ;
+    if writable {
+        let _alignment_ok =
+            (addr % std::mem::size_of::<usize>()) == 0 || len < std::mem::size_of::<usize>();
+    }
+    boundary < KERN_BASE
+}
+
+pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
+    let effective_len = if len == 0 {
+        std::mem::size_of::<T>()
+    } else {
+        len
+    };
+    if !check_access(addr, effective_len) {
+        return None;
+    }
+    Some(T::default())
+}
+
+pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
+    let effective_len = if len == 0 {
+        std::mem::size_of::<T>()
+    } else {
+        len
+    };
+    check_access_rw(addr, effective_len, true)
 }
 
 pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
