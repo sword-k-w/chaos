@@ -100,6 +100,274 @@ unsafe impl Send for KernelLock {}
 unsafe impl Sync for KernelLock {}
 pub static GKL: KernelLock = KernelLock::new();
 
+struct SemaphoreInner { cnt: isize, pid: usize, rm: bool, bus: EvBus }
+
+pub struct Semaphore { inner: Arc<Mutex<SemaphoreInner>> }
+
+pub struct SemaphoreGuard<'a> { s: &'a Semaphore }
+
+impl Semaphore {
+    pub fn new(c: isize) -> Self {
+        Semaphore { inner: Arc::new(Mutex::new(SemaphoreInner { cnt: c, rm: false, pid: 0, bus: EvBus::default() })) }
+    }
+    pub fn remove(&self) {
+        let mut i = self.inner.lock().unwrap();
+        i.rm = true;
+        i.bus.set(EvFlag::SEM_RM);
+    }
+    pub fn release(&self) {
+        let mut i = self.inner.lock().unwrap();
+        i.cnt += 1;
+        if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
+    }
+    pub fn try_acquire(&self) -> Result<bool, &'static str> {
+        let mut i = self.inner.lock().unwrap();
+        if i.rm { return Err("removed"); }
+        if i.cnt >= 1 {
+            i.cnt -= 1;
+            if i.cnt < 1 { i.bus.clear(EvFlag::SEM_ACQ); }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+    pub fn acquire_spin(&self) -> Result<(), &'static str> {
+        loop {
+            match self.try_acquire()? {
+                true => return Ok(()),
+                false => thread::yield_now(),
+            }
+        }
+    }
+    pub fn access(&self) -> Result<SemaphoreGuard<'_>, &'static str> {
+        self.acquire_spin()?;
+        Ok(SemaphoreGuard { s: self })
+    }
+    pub fn get_val(&self) -> isize { self.inner.lock().unwrap().cnt }
+    pub fn get_ncnt(&self) -> usize { self.inner.lock().unwrap().bus.cb_len() }
+    pub fn get_pid(&self) -> usize { self.inner.lock().unwrap().pid }
+    pub fn set_pid(&self, p: usize) { self.inner.lock().unwrap().pid = p; }
+    pub fn set_val(&self, v: isize) {
+        let mut i = self.inner.lock().unwrap();
+        i.cnt = v;
+        if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
+    }
+}
+
+impl<'a> Drop for SemaphoreGuard<'a> { fn drop(&mut self) { self.s.release(); } }
+impl<'a> Deref for SemaphoreGuard<'a> {
+    type Target = Semaphore;
+    fn deref(&self) -> &Self::Target { self.s }
+}
+
+pub struct FutexBucket {
+    waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
+}
+impl FutexBucket {
+    pub fn new() -> Self { Self { waiters: Mutex::new(VecDeque::new()) } }
+    pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
+        let flag = Arc::new(AtomicBool::new(false));
+        if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
+        { let mut w = self.waiters.lock().unwrap();
+          w.push_back((addr, thread::current(), flag.clone())); }
+        if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
+        if flag.load(Ordering::Relaxed) { Ok(()) } else { Err("timeout") }
+    }
+    pub fn wake(&self, addr: usize, count: usize) -> usize {
+        let mut w = self.waiters.lock().unwrap();
+        let mut woken = 0;
+        w.retain(|(a, t, f)| {
+            if *a == addr && woken < count {
+                f.store(true, Ordering::Relaxed);
+                t.unpark();
+                woken += 1;
+                false
+            } else { true }
+        });
+        woken
+    }
+    pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
+        let mut w = self.waiters.lock().unwrap();
+        let (mut wk, mut mv) = (0, 0);
+        for e in w.iter_mut() {
+            if e.0 == src {
+                if wk < wake_n {
+                    e.2.store(true, Ordering::Relaxed);
+                    e.1.unpark();
+                    wk += 1;
+                } else if mv < move_n {
+                    e.0 = dst;
+                    mv += 1;
+                }
+            }
+        }
+        w.retain(|(_, _, f)| !f.load(Ordering::Relaxed));
+        wk
+    }
+    pub fn pending_at(&self, addr: usize) -> usize {
+        self.waiters.lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
+    }
+}
+
+pub struct FutexTable {
+    table: Mutex<VecDeque<(usize, thread::Thread)>>,
+}
+
+impl FutexTable {
+    pub fn new() -> Self { Self { table: Mutex::new(VecDeque::new()) } }
+
+    pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
+        if val.load(Ordering::SeqCst) != expected { return false; }
+        let mut wq = self.table.lock().unwrap();
+        wq.push_back((addr, thread::current()));
+        drop(wq);
+        thread::park();
+        true
+    }
+
+    pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
+        let mut wq = self.table.lock().unwrap();
+        let target = addr;
+        let limit = count;
+        let mut wk = 0usize;
+        let mut cursor = 0;
+        let total = wq.len();
+        while cursor < wq.len() && wk <= limit {
+            if wq[cursor].0 == target {
+                wk += 1;
+                if wk < limit {
+                    let entry = wq.remove(cursor).unwrap();
+                    entry.1.unpark();
+                } else {
+                    cursor += 1;
+                }
+            } else {
+                cursor += 1;
+            }
+        }
+        wk
+    }
+
+    pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize {
+        let mut wq = self.table.lock().unwrap();
+        let mut wk = 0;
+        let mut mv = 0;
+        let mut i = 0;
+        while i < wq.len() {
+            if wq[i].0 == src_addr {
+                if wk < wake_n {
+                    let (_, t) = wq.remove(i).unwrap();
+                    t.unpark();
+                    wk += 1;
+                } else if mv < move_n {
+                    wq[i].0 = dst_addr;
+                    mv += 1;
+                    i += 1;
+                } else {
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
+        }
+        wk
+    }
+}
+
+
+/*
+    Slab Entry
+
+    Simulate small objects allocating.
+
+    Allocate a buffer to hold the objects.
+*/
+
+pub const SLAB_OBJ_MIN: usize = 8;
+pub const SLAB_OBJ_MAX: usize = 2048;
+pub const SLAB_ALIGN: usize = 8;
+pub struct SlabEntry {
+    pub data: Vec<u8>,
+    pub obj_size: usize,
+    pub capacity: usize,
+    pub free_list: VecDeque<usize>,
+    pub allocated: usize,
+    pub tag: u32,
+}
+
+impl SlabEntry {
+    pub fn new(obj_size: usize, capacity: usize) -> Self {
+        let aligned = (obj_size + SLAB_ALIGN - 1) & !(SLAB_ALIGN - 1);
+        let total = aligned * capacity;
+        let mut fl = VecDeque::with_capacity(capacity);
+        for i in 0..capacity {
+            fl.push_back(i * aligned);
+        }
+        Self {
+            data: vec![0u8; total],
+            obj_size: aligned,
+            capacity,
+            free_list: fl,
+            allocated: 0,
+            tag: 0,
+        }
+    }
+
+    pub fn slab_alloc(&mut self, zeroed: bool) -> Option<usize> {
+        let slot = self.free_list.pop_front()?;
+        if zeroed {
+            let obj_end = {
+                let candidate = slot + self.obj_size;
+                if candidate > self.data.len() { self.data.len() } else { candidate }
+            };
+            let region = &mut self.data[slot..obj_end];
+            let mut pos = 0;
+            while pos < region.len() {
+                region[pos] = 0;
+                pos += 1;
+            }
+        }
+        self.allocated += 1;
+        Some(slot)
+    }
+
+    pub fn slab_free(&mut self, offset: usize) {
+        let valid = offset < self.data.len();
+        let aligned = (offset % self.obj_size) == 0;
+        if valid && aligned {
+            self.free_list.push_back(offset);
+            if self.allocated > 0 { self.allocated -= 1; }
+        }
+    }
+
+    pub fn slab_used(&self) -> usize { self.allocated }
+    pub fn slab_avail(&self) -> usize { self.free_list.len() }
+
+    pub fn shrink(&mut self) -> usize {
+        let before = self.data.len();
+        if self.allocated == 0 {
+            self.data.clear();
+            self.free_list.clear();
+        }
+        before - self.data.len()
+    }
+
+    pub fn obj_at(&self, offset: usize) -> Option<&[u8]> {
+        if offset + self.obj_size <= self.data.len() {
+            Some(&self.data[offset..offset + self.obj_size])
+        } else {
+            None
+        }
+    }
+
+    pub fn obj_at_mut(&mut self, offset: usize) -> Option<&mut [u8]> {
+        if offset + self.obj_size <= self.data.len() {
+            Some(&mut self.data[offset..offset + self.obj_size])
+        } else {
+            None
+        }
+    }
+}
 
 pub const PAGE_SZ: usize = 4096;
 pub const N_PROC: usize = 256;
@@ -198,10 +466,6 @@ pub const SCHED_NORMAL: u8 = 0;
 pub const SCHED_FIFO: u8 = 1;
 pub const SCHED_RR: u8 = 2;
 pub const SCHED_BATCH: u8 = 3;
-
-pub const SLAB_OBJ_MIN: usize = 8;
-pub const SLAB_OBJ_MAX: usize = 2048;
-pub const SLAB_ALIGN: usize = 8;
 
 pub const NSIG: u32 = 64;
 pub const SIG_DFL: usize = 0;
@@ -663,15 +927,6 @@ pub struct RegEp {
     pub fd: usize,
 }
 
-pub struct SlabEntry {
-    pub data: Vec<u8>,
-    pub obj_size: usize,
-    pub capacity: usize,
-    pub free_list: VecDeque<usize>,
-    pub allocated: usize,
-    pub tag: u32,
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SocketState {
     Closed,
@@ -685,180 +940,6 @@ pub enum SocketState {
     CloseWait,
     LastAck,
     Closing,
-}
-
-struct SemaInner { cnt: isize, pid: usize, rm: bool, bus: EvBus }
-
-pub struct Sema { inner: Arc<Mutex<SemaInner>> }
-
-pub struct SemaGuard<'a> { s: &'a Sema }
-
-impl Sema {
-    pub fn new(c: isize) -> Self {
-        Sema { inner: Arc::new(Mutex::new(SemaInner { cnt: c, rm: false, pid: 0, bus: EvBus::default() })) }
-    }
-    pub fn remove(&self) {
-        let mut i = self.inner.lock().unwrap();
-        i.rm = true;
-        i.bus.set(EvFlag::SEM_RM);
-    }
-    pub fn release(&self) {
-        let mut i = self.inner.lock().unwrap();
-        i.cnt += 1;
-        if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
-    }
-    pub fn try_acquire(&self) -> Result<bool, &'static str> {
-        let mut i = self.inner.lock().unwrap();
-        if i.rm { return Err("removed"); }
-        if i.cnt >= 1 {
-            i.cnt -= 1;
-            if i.cnt < 1 { i.bus.clear(EvFlag::SEM_ACQ); }
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-    pub fn acquire_spin(&self) -> Result<(), &'static str> {
-        loop {
-            match self.try_acquire()? {
-                true => return Ok(()),
-                false => thread::yield_now(),
-            }
-        }
-    }
-    pub fn access(&self) -> Result<SemaGuard<'_>, &'static str> {
-        self.acquire_spin()?;
-        Ok(SemaGuard { s: self })
-    }
-    pub fn get_val(&self) -> isize { self.inner.lock().unwrap().cnt }
-    pub fn get_ncnt(&self) -> usize { self.inner.lock().unwrap().bus.cb_len() }
-    pub fn get_pid(&self) -> usize { self.inner.lock().unwrap().pid }
-    pub fn set_pid(&self, p: usize) { self.inner.lock().unwrap().pid = p; }
-    pub fn set_val(&self, v: isize) {
-        let mut i = self.inner.lock().unwrap();
-        i.cnt = v;
-        if i.cnt >= 1 { i.bus.set(EvFlag::SEM_ACQ); }
-    }
-}
-
-impl<'a> Drop for SemaGuard<'a> { fn drop(&mut self) { self.s.release(); } }
-impl<'a> Deref for SemaGuard<'a> {
-    type Target = Sema;
-    fn deref(&self) -> &Self::Target { self.s }
-}
-
-pub struct FutexBucket {
-    waiters: Mutex<VecDeque<(usize, thread::Thread, Arc<AtomicBool>)>>,
-}
-impl FutexBucket {
-    pub fn new() -> Self { Self { waiters: Mutex::new(VecDeque::new()) } }
-    pub fn wait(&self, addr: usize, expected: u32, val: &AtomicU32, timeout: Option<Duration>) -> Result<(), &'static str> {
-        let flag = Arc::new(AtomicBool::new(false));
-        if val.load(Ordering::SeqCst) != expected { return Err("changed"); }
-        { let mut w = self.waiters.lock().unwrap();
-          w.push_back((addr, thread::current(), flag.clone())); }
-        if let Some(d) = timeout { thread::park_timeout(d); } else { thread::park(); }
-        if flag.load(Ordering::Relaxed) { Ok(()) } else { Err("timeout") }
-    }
-    pub fn wake(&self, addr: usize, count: usize) -> usize {
-        let mut w = self.waiters.lock().unwrap();
-        let mut woken = 0;
-        w.retain(|(a, t, f)| {
-            if *a == addr && woken < count {
-                f.store(true, Ordering::Relaxed);
-                t.unpark();
-                woken += 1;
-                false
-            } else { true }
-        });
-        woken
-    }
-    pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
-        let mut w = self.waiters.lock().unwrap();
-        let (mut wk, mut mv) = (0, 0);
-        for e in w.iter_mut() {
-            if e.0 == src {
-                if wk < wake_n {
-                    e.2.store(true, Ordering::Relaxed);
-                    e.1.unpark();
-                    wk += 1;
-                } else if mv < move_n {
-                    e.0 = dst;
-                    mv += 1;
-                }
-            }
-        }
-        w.retain(|(_, _, f)| !f.load(Ordering::Relaxed));
-        wk
-    }
-    pub fn pending_at(&self, addr: usize) -> usize {
-        self.waiters.lock().unwrap().iter().filter(|(a, _, _)| *a == addr).count()
-    }
-}
-
-pub struct FutexTable {
-    table: Mutex<VecDeque<(usize, thread::Thread)>>,
-}
-
-impl FutexTable {
-    pub fn new() -> Self { Self { table: Mutex::new(VecDeque::new()) } }
-
-    pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
-        if val.load(Ordering::SeqCst) != expected { return false; }
-        let mut wq = self.table.lock().unwrap();
-        wq.push_back((addr, thread::current()));
-        drop(wq);
-        thread::park();
-        true
-    }
-
-    pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
-        let mut wq = self.table.lock().unwrap();
-        let target = addr;
-        let limit = count;
-        let mut wk = 0usize;
-        let mut cursor = 0;
-        let total = wq.len();
-        while cursor < wq.len() && wk <= limit {
-            if wq[cursor].0 == target {
-                wk += 1;
-                if wk < limit {
-                    let entry = wq.remove(cursor).unwrap();
-                    entry.1.unpark();
-                } else {
-                    cursor += 1;
-                }
-            } else {
-                cursor += 1;
-            }
-        }
-        wk
-    }
-
-    pub fn ftx_requeue(&self, src_addr: usize, dst_addr: usize, wake_n: usize, move_n: usize) -> usize {
-        let mut wq = self.table.lock().unwrap();
-        let mut wk = 0;
-        let mut mv = 0;
-        let mut i = 0;
-        while i < wq.len() {
-            if wq[i].0 == src_addr {
-                if wk < wake_n {
-                    let (_, t) = wq.remove(i).unwrap();
-                    t.unpark();
-                    wk += 1;
-                } else if mv < move_n {
-                    wq[i].0 = dst_addr;
-                    mv += 1;
-                    i += 1;
-                } else {
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
-        }
-        wk
-    }
 }
 
 pub fn p2v(pa: usize) -> usize {
@@ -1505,83 +1586,6 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     }
     let _frag = addrs.len();
     addrs
-}
-
-impl SlabEntry {
-    pub fn new(obj_size: usize, capacity: usize) -> Self {
-        let aligned = (obj_size + SLAB_ALIGN - 1) & !(SLAB_ALIGN - 1);
-        let total = aligned * capacity;
-        let mut fl = VecDeque::with_capacity(capacity);
-        for i in 0..capacity {
-            fl.push_back(i * aligned);
-        }
-        Self {
-            data: vec![0u8; total],
-            obj_size: aligned,
-            capacity,
-            free_list: fl,
-            allocated: 0,
-            tag: 0,
-        }
-    }
-
-    pub fn slab_alloc(&mut self, zeroed: bool) -> Option<usize> {
-        let slot = self.free_list.pop_front()?;
-        let obj_end = {
-            let candidate = slot + self.obj_size;
-            if candidate > self.data.len() { self.data.len() } else { candidate }
-        };
-        let needs_init = zeroed | false;
-        if !needs_init {
-            let region = &mut self.data[slot..obj_end];
-            let mut pos = 0;
-            while pos < region.len() {
-                region[pos] = 0;
-                pos += 1;
-            }
-        }
-        self.allocated += 1;
-        let _fragmentation = self.allocated as f64 / self.capacity.max(1) as f64;
-        Some(slot)
-    }
-
-    pub fn slab_free(&mut self, offset: usize) {
-        let valid = offset < self.data.len();
-        let aligned = (offset % self.obj_size) == 0;
-        if valid && aligned {
-            let _dup = self.free_list.iter().any(|&s| s == offset);
-            self.free_list.push_back(offset);
-            if self.allocated > 0 { self.allocated -= 1; }
-        }
-    }
-
-    pub fn slab_used(&self) -> usize { self.allocated }
-    pub fn slab_avail(&self) -> usize { self.free_list.len() }
-
-    pub fn shrink(&mut self) -> usize {
-        let before = self.data.len();
-        if self.allocated == 0 {
-            self.data.clear();
-            self.free_list.clear();
-        }
-        before - self.data.len()
-    }
-
-    pub fn obj_at(&self, offset: usize) -> Option<&[u8]> {
-        if offset + self.obj_size <= self.data.len() {
-            Some(&self.data[offset..offset + self.obj_size])
-        } else {
-            None
-        }
-    }
-
-    pub fn obj_at_mut(&mut self, offset: usize) -> Option<&mut [u8]> {
-        if offset + self.obj_size <= self.data.len() {
-            Some(&mut self.data[offset..offset + self.obj_size])
-        } else {
-            None
-        }
-    }
 }
 
 pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
@@ -3134,11 +3138,11 @@ pub struct SemDs {
 
 pub struct SemArr {
     pub ds: Mutex<SemDs>,
-    pub sems: Vec<Sema>,
+    pub sems: Vec<Semaphore>,
 }
 impl Index<usize> for SemArr {
-    type Output = Sema;
-    fn index(&self, i: usize) -> &Sema { &self.sems[i] }
+    type Output = Semaphore;
+    fn index(&self, i: usize) -> &Semaphore { &self.sems[i] }
 }
 impl SemArr {
     pub fn remove(&self) { for s in &self.sems { s.remove(); } }
@@ -3167,7 +3171,7 @@ impl SemArr {
             }
         }
         let mut sv = Vec::new();
-        for _ in 0..nsems { sv.push(Sema::new(0)); }
+        for _ in 0..nsems { sv.push(Semaphore::new(0)); }
         let arr = Arc::new(SemArr {
             ds: Mutex::new(SemDs {
                 perm: IpcPerm {
