@@ -11,6 +11,96 @@ use std::ops::{Deref, DerefMut, Index};
 use std::any::Any;
 use std::cmp::{min, max, Ordering as CmpOrd};
 
+/*
+    Concurrency Primitives
+
+*/
+pub struct Spin { v: AtomicBool }
+impl Spin {
+    pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
+    pub fn acquire(&self) {
+        while self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+    }
+    pub fn try_acquire(&self) -> bool {
+        self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+    }
+    pub fn release(&self) { self.v.store(false, Ordering::Release); }
+    pub fn is_held(&self) -> bool { self.v.load(Ordering::Relaxed) }
+}
+unsafe impl Send for Spin {}
+unsafe impl Sync for Spin {}
+
+pub struct KernelLock {
+    flag: AtomicBool,
+    holder: AtomicUsize,
+    depth: AtomicUsize,
+
+    holder_id: AtomicUsize,
+}
+impl KernelLock {
+    pub const fn new() -> Self {  Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0), holder_id: AtomicUsize::new(0) } }
+    
+    /*
+        id is stored in holder_id. metadata
+
+        thread_id is the actual holder.
+
+        Same holder can enter multiple times(stored in depth) once entered.
+    */
+    pub fn enter(&self, id: usize) {
+        let thread_id = thread::current().id().as_u64().get() as usize;
+        if self.holder.load(Ordering::Relaxed) == thread_id && self.flag.load(Ordering::Relaxed) {
+            self.depth.fetch_add(1, Ordering::Relaxed);
+            self.holder_id.store(id, Ordering::Relaxed);
+            return;
+        }
+        while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+        self.holder.store(thread_id, Ordering::Relaxed);
+        self.holder_id.store(id, Ordering::Relaxed);
+        self.depth.store(1, Ordering::Relaxed);
+    }
+    pub fn leave(&self) {
+        let d = self.level();
+        if (d == 0) {
+            return;
+        }
+        self.depth.store(d - 1, Ordering::Relaxed);
+        if (d == 1) {
+            self.flag.store(false, Ordering::Release);
+            self.holder.store(0, Ordering::Relaxed);
+            self.holder_id.store(0, Ordering::Relaxed);
+        }
+    }
+    pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
+    pub fn owner(&self) -> usize { self.holder_id.load(Ordering::Relaxed) }
+    pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
+    
+    pub fn try_enter(&self, id: usize) -> bool {
+        let thread_id = thread::current().id().as_u64().get() as usize;
+        if self.holder.load(Ordering::Relaxed) == thread_id && self.flag.load(Ordering::Relaxed) {
+            self.depth.fetch_add(1, Ordering::Relaxed);
+            self.holder_id.store(id, Ordering::Relaxed);
+            return true;
+        }
+        if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            self.holder.store(thread_id, Ordering::Relaxed);
+            self.depth.store(1, Ordering::Relaxed);
+            self.holder_id.store(id, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+}
+unsafe impl Send for KernelLock {}
+unsafe impl Sync for KernelLock {}
+pub static GKL: KernelLock = KernelLock::new();
+
+
 pub const PAGE_SZ: usize = 4096;
 pub const N_PROC: usize = 256;
 pub const N_FRAMES: usize = 65536;
@@ -203,67 +293,6 @@ pub struct TimerEntry {
     pub repeat: bool,
 }
 
-pub struct KernLock {
-    flag: AtomicBool,
-    holder: AtomicUsize,
-    depth: AtomicUsize,
-
-    holder_id: AtomicUsize,
-}
-impl KernLock {
-    pub const fn new() -> Self {  Self { flag: AtomicBool::new(false), holder: AtomicUsize::new(0), depth: AtomicUsize::new(0), holder_id: AtomicUsize::new(0) } }
-    
-    pub fn enter(&self, id: usize) {
-        let thread_id = thread::current().id().as_u64().get() as usize;
-        if self.holder.load(Ordering::Relaxed) == thread_id && self.flag.load(Ordering::Relaxed) {
-            self.depth.fetch_add(1, Ordering::Relaxed);
-            self.holder_id.store(id, Ordering::Relaxed);
-            return;
-        }
-        while self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
-        }
-        self.holder.store(thread_id, Ordering::Relaxed);
-        self.holder_id.store(id, Ordering::Relaxed);
-        self.depth.store(1, Ordering::Relaxed);
-    }
-    pub fn leave(&self) {
-        let d = self.level();
-        if (d == 0) {
-            return;
-        }
-        self.depth.store(d - 1, Ordering::Relaxed);
-        if (d == 1) {
-            self.flag.store(false, Ordering::Release);
-            self.holder.store(0, Ordering::Relaxed);
-            self.holder_id.store(0, Ordering::Relaxed);
-        }
-    }
-    pub fn held(&self) -> bool { self.flag.load(Ordering::Relaxed) }
-    pub fn owner(&self) -> usize { self.holder_id.load(Ordering::Relaxed) }
-    pub fn level(&self) -> usize { self.depth.load(Ordering::Relaxed) }
-    
-    pub fn try_enter(&self, id: usize) -> bool {
-        let thread_id = thread::current().id().as_u64().get() as usize;
-        if self.holder.load(Ordering::Relaxed) == thread_id && self.flag.load(Ordering::Relaxed) {
-            self.depth.fetch_add(1, Ordering::Relaxed);
-            self.holder_id.store(id, Ordering::Relaxed);
-            return true;
-        }
-        if self.flag.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            self.holder.store(thread_id, Ordering::Relaxed);
-            self.depth.store(1, Ordering::Relaxed);
-            self.holder_id.store(id, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    }
-}
-unsafe impl Send for KernLock {}
-unsafe impl Sync for KernLock {}
-pub static GKL: KernLock = KernLock::new();
-
 pub struct ZoneInfo {
     pub zone_id: usize,
     pub base_pfn: usize,
@@ -274,22 +303,6 @@ pub struct ZoneInfo {
     pub managed: AtomicBool,
 }
 
-pub struct Spin { v: AtomicBool }
-impl Spin {
-    pub const fn new() -> Self { Self { v: AtomicBool::new(false) } }
-    pub fn acquire(&self) {
-        while self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
-        }
-    }
-    pub fn try_acquire(&self) -> bool {
-        self.v.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
-    }
-    pub fn release(&self) { self.v.store(false, Ordering::Release); }
-    pub fn is_held(&self) -> bool { self.v.load(Ordering::Relaxed) }
-}
-unsafe impl Send for Spin {}
-unsafe impl Sync for Spin {}
 
 pub struct CircBuf {
     pub data: Vec<u8>,

@@ -32,3 +32,5 @@ modules/*/target
 test/
 
 CLAUDE.md
+
+chaos-tests/tests/adv/*
