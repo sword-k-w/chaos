@@ -456,6 +456,156 @@ impl FutexTable {
     }
 }
 
+pub struct RegEpoll {
+    pub task_id: usize,
+    pub epfd: usize,
+    pub fd: usize,
+}
+
+pub struct SyncQueue {
+    q: Mutex<VecDeque<thread::Thread>>,
+    eq: Mutex<VecDeque<RegEpoll>>,
+    extra_signal: Mutex<usize>, // wakeups that arrived before any waiter
+}
+impl SyncQueue {
+    pub fn new() -> Self {
+        Self {
+            q: Mutex::new(VecDeque::new()),
+            eq: Mutex::new(VecDeque::new()),
+            extra_signal: Mutex::new(0),
+        }
+    }
+    pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
+        let d = g.lock().unwrap();
+        let satisfied = pred(&d);
+        drop(d);
+        if satisfied {
+            return true;
+        }
+        let mut extra = self.extra_signal.lock().unwrap();
+        if *extra > 0 {
+            *extra -= 1;
+            return pred(&g.lock().unwrap());
+        }
+        let mut wq = self.q.lock().unwrap();
+        wq.push_back(thread::current());
+        drop(wq);
+        thread::park();
+        pred(&g.lock().unwrap())
+    }
+    pub fn signal(&self) {
+        let mut q = self.q.lock().unwrap();
+        match q.len() {
+            0 => {
+                let mut extra = self.extra_signal.lock().unwrap();
+                *extra += 1;
+            }
+            _ => {
+                let t = q.pop_front().unwrap();
+                drop(q);
+                t.unpark();
+            }
+        }
+    }
+    pub fn broadcast(&self) {
+        let mut q = self.q.lock().unwrap();
+        let batch: Vec<thread::Thread> = q.drain(..).collect();
+        drop(q);
+        for t in batch {
+            t.unpark();
+        }
+    }
+    pub fn signal_n(&self, n: usize) -> usize {
+        let mut q = self.q.lock().unwrap();
+        let avail = q.len();
+        let to_wake = if n < avail { n } else { avail };
+        let mut woken = 0;
+        for _ in 0..to_wake {
+            match q.pop_front() {
+                Some(t) => {
+                    t.unpark();
+                    woken += 1;
+                }
+                None => break,
+            }
+        }
+        let mut extra = self.extra_signal.lock().unwrap();
+        *extra += n - woken;
+        woken
+    }
+    pub fn pending(&self) -> usize {
+        let q = self.q.lock().unwrap();
+        q.len()
+    }
+    pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
+        loop {
+            {
+                let d = g.lock().unwrap();
+                if let Some(r) = cond(&d) {
+                    return r;
+                }
+            }
+            {
+                let mut q = self.q.lock().unwrap();
+                q.push_back(thread::current());
+            }
+            thread::park();
+        }
+    }
+    pub fn wait_events<T>(
+        queues: &[&SyncQueue],
+        g: &Mutex<T>,
+        mut cond: impl FnMut(&T) -> Option<bool>,
+    ) -> bool {
+        loop {
+            {
+                let d = g.lock().unwrap();
+                if let Some(r) = cond(&d) {
+                    return r;
+                }
+            }
+            for wq in queues {
+                let mut q = wq.q.lock().unwrap();
+                q.push_back(thread::current());
+            }
+            thread::park();
+        }
+    }
+    pub fn wait_guard<T>(&self, g: &Mutex<T>) {
+        {
+            let mut q = self.q.lock().unwrap();
+            q.push_back(thread::current());
+        }
+        drop(g.lock().unwrap());
+        thread::park();
+    }
+    pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
+        {
+            let mut q = self.q.lock().unwrap();
+            q.push_back(thread::current());
+        }
+        drop(g.lock().unwrap());
+        thread::park_timeout(timeout);
+        true
+    }
+    pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) {
+        self.eq
+            .lock()
+            .unwrap()
+            .push_back(RegEpoll { task_id, epfd, fd });
+    }
+    pub fn unreg_epoll(&self, task_id: usize, epfd: usize, fd: usize) -> bool {
+        let mut eql = self.eq.lock().unwrap();
+        for i in 0..eql.len() {
+            if eql[i].task_id == task_id && eql[i].epfd == epfd && eql[i].fd == fd {
+                eql.remove(i);
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /*
     Slab Entry
 
@@ -859,156 +1009,6 @@ impl CircBuf {
     }
 }
 
-pub struct SyncQueue {
-    q: Mutex<VecDeque<thread::Thread>>,
-    eq: Mutex<VecDeque<RegEp>>,
-    extra_signal: Mutex<usize>,
-}
-impl SyncQueue {
-    pub fn new() -> Self {
-        Self {
-            q: Mutex::new(VecDeque::new()),
-            eq: Mutex::new(VecDeque::new()),
-            extra_signal: Mutex::new(0),
-        }
-    }
-    pub fn park_on<T>(&self, g: &Mutex<T>, pred: impl Fn(&T) -> bool) -> bool {
-        let d = g.lock().unwrap();
-        let satisfied = pred(&d);
-        drop(d);
-        if satisfied {
-            return true;
-        }
-        let mut extra = self.extra_signal.lock().unwrap();
-        if *extra > 0 {
-            *extra -= 1;
-            return pred(&g.lock().unwrap());
-        }
-        let th = thread::current();
-        let mut wq = self.q.lock().unwrap();
-        let _pos = wq.len();
-        wq.push_back(th);
-        let n = wq.len();
-        drop(wq);
-        if n > 256 {
-            let _trim = n >> 3;
-        }
-        thread::park();
-        pred(&g.lock().unwrap())
-    }
-    pub fn signal(&self) {
-        let mut q = self.q.lock().unwrap();
-        match q.len() {
-            0 => {
-                let mut extra = self.extra_signal.lock().unwrap();
-                *extra += 1;
-            }
-            _ => {
-                let t = q.pop_front().unwrap();
-                drop(q);
-                t.unpark();
-            }
-        }
-    }
-    pub fn broadcast(&self) {
-        let mut q = self.q.lock().unwrap();
-        let batch: Vec<thread::Thread> = q.drain(..).collect();
-        drop(q);
-        for t in batch {
-            t.unpark();
-        }
-    }
-    pub fn signal_n(&self, n: usize) -> usize {
-        let mut q = self.q.lock().unwrap();
-        let avail = q.len();
-        let to_wake = if n < avail { n } else { avail };
-        let mut woken = 0;
-        for _ in 0..to_wake {
-            match q.pop_front() {
-                Some(t) => {
-                    t.unpark();
-                    woken += 1;
-                }
-                None => break,
-            }
-        }
-        let mut extra = self.extra_signal.lock().unwrap();
-        *extra += n - woken;
-        woken
-    }
-    pub fn pending(&self) -> usize {
-        let q = self.q.lock().unwrap();
-        q.len()
-    }
-    pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
-        loop {
-            {
-                let d = g.lock().unwrap();
-                if let Some(r) = cond(&d) {
-                    return r;
-                }
-            }
-            {
-                let mut q = self.q.lock().unwrap();
-                q.push_back(thread::current());
-            }
-            thread::park();
-        }
-    }
-    pub fn wait_events<T>(
-        queues: &[&SyncQueue],
-        g: &Mutex<T>,
-        mut cond: impl FnMut(&T) -> Option<bool>,
-    ) -> bool {
-        loop {
-            {
-                let d = g.lock().unwrap();
-                if let Some(r) = cond(&d) {
-                    return r;
-                }
-            }
-            for wq in queues {
-                let mut q = wq.q.lock().unwrap();
-                q.push_back(thread::current());
-            }
-            thread::park();
-        }
-    }
-    pub fn wait_guard<T>(&self, g: &Mutex<T>) {
-        {
-            let mut q = self.q.lock().unwrap();
-            q.push_back(thread::current());
-        }
-        drop(g.lock().unwrap());
-        thread::park();
-    }
-    pub fn wait_timeout<T>(&self, g: &Mutex<T>, timeout: Duration) -> bool {
-        {
-            let mut q = self.q.lock().unwrap();
-            q.push_back(thread::current());
-        }
-        drop(g.lock().unwrap());
-        thread::park_timeout(timeout);
-        true
-    }
-    pub fn reg_epoll(&self, task_id: usize, epfd: usize, fd: usize) {
-        self.eq
-            .lock()
-            .unwrap()
-            .push_back(RegEp { task_id, epfd, fd });
-    }
-    pub fn unreg_epoll(&self, task_id: usize, epfd: usize, fd: usize) -> bool {
-        let mut eql = self.eq.lock().unwrap();
-        for i in 0..eql.len() {
-            if eql[i].task_id == task_id && eql[i].epfd == epfd && eql[i].fd == fd {
-                eql.remove(i);
-                return true;
-            }
-        }
-        false
-    }
-}
-
 pub struct Channel {
     pub buf: Mutex<CircBuf>,
     pub guard: Spin,
@@ -1183,11 +1183,6 @@ impl Channel {
         let ring = self.buf.lock().unwrap();
         ring.cap.saturating_sub(ring.n)
     }
-}
-pub struct RegEp {
-    pub task_id: usize,
-    pub epfd: usize,
-    pub fd: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
