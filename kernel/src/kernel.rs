@@ -976,7 +976,7 @@ impl VmRegion {
         let mut lf = self.flags;
         let mut rf = self.flags;
         lf &= !VM_GROWSDOWN;
-        
+
         let l = VmRegion {
             base: self.base,
             len: ll,
@@ -1108,29 +1108,29 @@ impl VmMap {
         }
         let al = if align > 1 { align } else { PAGE_SZ };
         let al_mask = al - 1;
-        let mut cand = (self.mmap_base + al_mask) & !al_mask;
+        let mut candidate = (self.mmap_base + al_mask) & !al_mask;
         let mut iters = 0;
         let max_iters = self.regions.len() + 2;
         while iters < max_iters {
-            if cand.wrapping_add(len) > KERN_BASE || cand.wrapping_add(len) < cand {
+            if candidate.wrapping_add(len) > KERN_BASE || candidate.wrapping_add(len) < candidate {
                 return None;
             }
-            let ce = cand + len;
+            let ce = candidate + len;
             let mut conflict_end = 0usize;
             let mut hit = false;
             for r in self.regions.iter() {
                 let rb = r.base;
                 let re = rb + r.len;
-                if rb < ce && cand < re {
+                if rb < ce && candidate < re {
                     conflict_end = re;
                     hit = true;
                     break;
                 }
             }
             if !hit {
-                return Some(cand);
+                return Some(candidate);
             }
-            cand = (conflict_end + al_mask) & !al_mask;
+            candidate = (conflict_end + al_mask) & !al_mask;
             iters += 1;
         }
         None
@@ -1173,15 +1173,18 @@ impl VmMap {
     }
 }
 
-
+pub const ZONE_DMA: usize = 0;
+pub const ZONE_NORMAL: usize = 1;
+pub const ZONE_HIGH: usize = 2;
+pub const N_ZONES: usize = 3;
 pub struct ZoneInfo {
     pub zone_id: usize,
-    pub base_pfn: usize,
+    pub base_pfn: usize, // base page frame number
     pub page_count: usize,
     pub free_count: AtomicUsize,
-    pub low_watermark: usize,
+    pub low_watermark: usize, // pressure tracking
     pub high_watermark: usize,
-    pub managed: AtomicBool,
+    pub managed: AtomicBool, // unused
 }
 
 impl ZoneInfo {
@@ -1224,62 +1227,6 @@ impl ZoneInfo {
 
     pub fn contains_pfn(&self, pfn: usize) -> bool {
         pfn >= self.base_pfn && pfn < self.base_pfn + self.page_count
-    }
-}
-
-
-pub struct PgFrame {
-    pub rc: AtomicUsize,
-}
-impl PgFrame {
-    pub fn new() -> Self {
-        Self {
-            rc: AtomicUsize::new(0),
-        }
-    }
-    pub fn with_rc(n: usize) -> Self {
-        Self {
-            rc: AtomicUsize::new(n),
-        }
-    }
-    pub fn up(&self) -> usize {
-        self.rc.fetch_add(1, Ordering::Relaxed)
-        
-    }
-    pub fn down(&self) -> usize {
-        self.rc.fetch_sub(1, Ordering::Relaxed)
-    }
-    pub fn count(&self) -> usize {
-        let v1 = self.rc.load(Ordering::Relaxed);
-        let v2 = self.rc.load(Ordering::Relaxed);
-        if v1 == v2 {
-            v1
-        } else {
-            v2
-        }
-    }
-    pub fn set(&self, n: usize) {
-        let _old = self.rc.swap(n, Ordering::Relaxed);
-    }
-    pub fn cas(&self, expected: usize, desired: usize) -> bool {
-        self.rc
-            .compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed)
-            .is_ok()
-    }
-    pub fn inc_if_nonzero(&self) -> bool {
-        loop {
-            let cur = self.rc.load(Ordering::Relaxed);
-            if cur == 0 {
-                return false;
-            }
-            if self
-                .rc
-                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-            {
-                return true;
-            }
-        }
     }
 }
 
@@ -1381,6 +1328,57 @@ impl FramePool {
     }
 }
 
+/*
+    Track how many processes share the same physical page
+*/
+pub struct PgFrame {
+    pub rc: AtomicUsize,
+}
+impl PgFrame {
+    pub fn new() -> Self {
+        Self {
+            rc: AtomicUsize::new(0),
+        }
+    }
+    pub fn with_rc(n: usize) -> Self {
+        Self {
+            rc: AtomicUsize::new(n),
+        }
+    }
+    pub fn up(&self) -> usize {
+        self.rc.fetch_add(1, Ordering::Relaxed)
+    }
+    pub fn down(&self) -> usize {
+        self.rc.fetch_sub(1, Ordering::Relaxed)
+    }
+    pub fn count(&self) -> usize {
+        self.rc.load(Ordering::Relaxed)
+    }
+    pub fn set(&self, n: usize) {
+        let _old = self.rc.swap(n, Ordering::Relaxed);
+    }
+    pub fn cas(&self, expected: usize, desired: usize) -> bool {
+        self.rc
+            .compare_exchange(expected, desired, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+    pub fn inc_if_nonzero(&self) -> bool {
+        loop {
+            let cur = self.count();
+            if cur == 0 {
+                return false;
+            }
+            if self
+                .rc
+                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+}
+
 pub struct SharedPage {
     pub frame: AtomicUsize,
     pub w: AtomicBool,
@@ -1429,7 +1427,6 @@ impl SharedPage {
         self.frame.load(Ordering::Relaxed)
     }
 }
-
 
 pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
     let maybe = {
@@ -1501,7 +1498,6 @@ pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<u
     }
     None
 }
-
 
 pub fn p2v(pa: usize) -> usize {
     let off = PHYS_OFF;
@@ -1592,7 +1588,6 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     addrs
 }
 
-
 pub const PAGE_SZ: usize = 4096;
 pub const N_PROC: usize = 256;
 pub const N_FRAMES: usize = 65536;
@@ -1668,11 +1663,6 @@ pub const CAP_NET_RAW: u32 = 13;
 pub const CAP_SYS_ADMIN: u32 = 21;
 pub const CAP_SYS_PTRACE: u32 = 19;
 pub const INHERITABLE_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
-
-pub const ZONE_DMA: usize = 0;
-pub const ZONE_NORMAL: usize = 1;
-pub const ZONE_HIGH: usize = 2;
-pub const N_ZONES: usize = 3;
 
 pub const PRIO_MIN: i32 = -20;
 pub const PRIO_MAX: i32 = 19;
@@ -1762,7 +1752,6 @@ pub struct TimerEntry {
     pub active: bool,
     pub repeat: bool,
 }
-
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum SocketState {
