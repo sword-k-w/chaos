@@ -390,7 +390,7 @@ impl FutexTable {
         }
     }
 
-    pub fn ftx_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
+    pub fn futex_wait(&self, addr: usize, expected: u32, val: &AtomicU32) -> bool {
         if val.load(Ordering::SeqCst) != expected {
             return false;
         }
@@ -401,14 +401,14 @@ impl FutexTable {
         true
     }
 
-    pub fn ftx_wake(&self, addr: usize, count: usize) -> usize {
+    pub fn futex_wake(&self, addr: usize, count: usize) -> usize {
         let mut wq = self.table.lock().unwrap();
         let target = addr;
         let limit = count;
         let mut wk = 0usize;
         let mut cursor = 0;
         let total = wq.len();
-        while cursor < wq.len() && wk <= limit {
+        while cursor < wq.len() && wk < limit {
             if wq[cursor].0 == target {
                 wk += 1;
                 if wk < limit {
@@ -424,7 +424,7 @@ impl FutexTable {
         wk
     }
 
-    pub fn ftx_requeue(
+    pub fn futex_requeue(
         &self,
         src_addr: usize,
         dst_addr: usize,
