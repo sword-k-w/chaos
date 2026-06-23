@@ -153,8 +153,8 @@ impl EventBitflag {
     pub const PROC_QUIT: u32 = 1 << 10;
     pub const CHILD_QUIT: u32 = 1 << 11;
     pub const RECV_SIG: u32 = 1 << 12;
-    pub const SEM_RM: u32 = 1 << 20;
-    pub const SEM_ACQ: u32 = 1 << 21;
+    pub const SEMAPHORE_REMOVED: u32 = 1 << 20;
+    pub const SEMAPHORE_AVAILABLE: u32 = 1 << 21;
 }
 
 #[derive(Default)]
@@ -172,6 +172,10 @@ impl EventBus {
     pub fn clear(&mut self, s: u32) {
         self.change(s, 0);
     }
+    /*
+        Update the state of the event.
+        If changed, callback then.
+    */
     pub fn change(&mut self, rst: u32, s: u32) {
         let orig = self.event;
         self.event = (self.event & !rst) | s;
@@ -228,13 +232,13 @@ impl Semaphore {
     pub fn remove(&self) {
         let mut i = self.inner.lock().unwrap();
         i.rm = true;
-        i.bus.set(EventBitflag::SEM_RM);
+        i.bus.set(EventBitflag::SEMAPHORE_REMOVED);
     }
     pub fn release(&self) {
         let mut i = self.inner.lock().unwrap();
         i.cnt += 1;
         if i.cnt >= 1 {
-            i.bus.set(EventBitflag::SEM_ACQ);
+            i.bus.set(EventBitflag::SEMAPHORE_AVAILABLE);
         }
     }
     pub fn try_acquire(&self) -> Result<bool, &'static str> {
@@ -245,7 +249,7 @@ impl Semaphore {
         if i.cnt >= 1 {
             i.cnt -= 1;
             if i.cnt < 1 {
-                i.bus.clear(EventBitflag::SEM_ACQ);
+                i.bus.clear(EventBitflag::SEMAPHORE_AVAILABLE);
             }
             Ok(true)
         } else {
@@ -280,7 +284,7 @@ impl Semaphore {
         let mut i = self.inner.lock().unwrap();
         i.cnt = v;
         if i.cnt >= 1 {
-            i.bus.set(EventBitflag::SEM_ACQ);
+            i.bus.set(EventBitflag::SEMAPHORE_AVAILABLE);
         }
     }
 }
