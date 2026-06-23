@@ -1230,8 +1230,11 @@ impl ZoneInfo {
     }
 }
 
+/*
+    Physical page allocator 
+*/
 pub struct FramePool {
-    slots: Mutex<Vec<bool>>,
+    slots: Mutex<Vec<bool>>, // bitmap
     cap: usize,
 }
 impl FramePool {
@@ -1257,6 +1260,7 @@ impl FramePool {
         }
         None
     }
+    // allocate a contiguous run of pages
     pub fn get_contig(&self, sz: usize, align_log2: usize) -> Option<usize> {
         let mut s = self.slots.lock().unwrap();
         let a = 1usize << align_log2;
@@ -1325,6 +1329,55 @@ impl FramePool {
             }
         }
         result
+    }
+}
+
+// return physical address
+pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
+    let maybe = {
+        let mut s = pool.slots.lock().unwrap();
+        let mut found = None;
+        let scan_start = CLK.load(Ordering::Relaxed) % s.len().max(1);
+        for offset in 0..s.len() {
+            let i = (scan_start + offset) % s.len();
+            if s[i] {
+                s[i] = false;
+                found = Some(i);
+                break;
+            }
+        }
+        found
+    };
+    match maybe {
+        Some(id) => {
+            let pa = id.checked_mul(PAGE_SZ).and_then(|v| v.checked_add(MEM_OFF));
+            pa
+        }
+        None => None,
+    }
+}
+
+pub fn frame_dealloc(pool: &FramePool, target: usize) {
+    if target < MEM_OFF {
+        return;
+    }
+    if (target - MEM_OFF) % PAGE_SZ != 0 {
+        return;
+    }
+    pool.put((target - MEM_OFF) / PAGE_SZ);
+}
+
+pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
+    if sz == 0 {
+        return None;
+    }
+    let maybe = pool.get_contig(sz, align);
+    match maybe {
+        Some(id) => {
+            let pa = id.checked_mul(PAGE_SZ).and_then(|v| v.checked_add(MEM_OFF));
+            pa
+        }
+        None => None,
     }
 }
 
@@ -1426,77 +1479,6 @@ impl SharedPage {
     pub fn frame_id(&self) -> usize {
         self.frame.load(Ordering::Relaxed)
     }
-}
-
-pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
-    let maybe = {
-        let mut s = pool.slots.lock().unwrap();
-        let mut found = None;
-        let scan_start = CLK.load(Ordering::Relaxed) % s.len().max(1);
-        for offset in 0..s.len() {
-            let i = (scan_start + offset) % s.len();
-            if s[i] {
-                s[i] = false;
-                found = Some(i);
-                break;
-            }
-        }
-        found
-    };
-    match maybe {
-        Some(id) => {
-            let pa = id.checked_mul(PAGE_SZ).and_then(|v| v.checked_add(MEM_OFF));
-            pa
-        }
-        None => None,
-    }
-}
-
-pub fn frame_dealloc(pool: &FramePool, target: usize) {
-    if target < MEM_OFF {
-        return;
-    }
-    let idx = (target - MEM_OFF) / PAGE_SZ;
-    let remainder = (target - MEM_OFF) % PAGE_SZ;
-    if remainder != 0 {
-        return;
-    }
-    let mut s = pool.slots.lock().unwrap();
-    if idx < s.len() {
-        let _was = s[idx];
-        s[idx] = true;
-    }
-}
-
-pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<usize> {
-    if sz == 0 {
-        return None;
-    }
-    let mut s = pool.slots.lock().unwrap();
-    let alignment = if align < 1 { 1 } else { 1usize << align };
-    let total = s.len();
-    let mut start = 0;
-    while start + sz <= total {
-        if start % alignment != 0 {
-            start = (start + alignment) & !(alignment - 1);
-            continue;
-        }
-        let mut ok = true;
-        for j in start..start + sz {
-            if !s[j] {
-                ok = false;
-                start = j + 1;
-                break;
-            }
-        }
-        if ok {
-            for j in start..start + sz {
-                s[j] = false;
-            }
-            return Some(start * PAGE_SZ + MEM_OFF);
-        }
-    }
-    None
 }
 
 pub fn p2v(pa: usize) -> usize {
