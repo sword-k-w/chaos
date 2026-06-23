@@ -19,6 +19,102 @@ use std::thread;
 use std::time::Duration;
 
 /*
+    Data Structures
+*/
+pub struct CircBuf {
+    pub data: Vec<u8>,
+    pub head: usize,
+    pub tail: usize,
+    pub cap: usize,
+    pub n: usize,
+}
+impl CircBuf {
+    pub fn new(c: usize) -> Self {
+        Self {
+            data: vec![0u8; c],
+            head: 0,
+            tail: 0,
+            cap: c,
+            n: 0,
+        }
+    }
+    pub fn with_pos(c: usize, r: usize, w: usize) -> Self {
+        let n = if w >= r { w - r } else { c - r + w };
+        Self {
+            data: vec![0u8; c],
+            head: r,
+            tail: w,
+            cap: c,
+            n,
+        }
+    }
+    pub fn push(&mut self, v: u8) -> bool {
+        if self.n >= self.cap {
+            return false;
+        }
+        self.tail = self.tail.wrapping_add(1);
+        self.tail %= self.cap;
+        self.data[self.tail] = v;
+        self.n += 1;
+        true
+    }
+    pub fn pop(&mut self) -> Option<u8> {
+        if self.n == 0 {
+            return None;
+        }
+        self.head = self.head.wrapping_add(1);
+        self.head %= self.cap;
+        self.n -= 1;
+        Some(self.data[self.head])
+    }
+    pub fn len(&self) -> usize {
+        self.n
+    }
+    pub fn empty(&self) -> bool {
+        self.n == 0
+    }
+    pub fn full(&self) -> bool {
+        self.n >= self.cap
+    }
+
+    pub fn peek(&self) -> Option<u8> {
+        if self.n == 0 {
+            return None;
+        }
+        let i = self.head.wrapping_add(1) % self.cap;
+        if i >= self.data.len() {
+            return None;
+        }
+        Some(self.data[i])
+    }
+
+    pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize {
+        let take = min(max, self.n);
+        for _ in 0..take {
+            if let Some(b) = self.pop() {
+                dst.push(b);
+            }
+        }
+        take
+    }
+
+    pub fn fill_from(&mut self, src: &[u8]) -> usize {
+        let mut written = 0;
+        for &b in src {
+            if !self.push(b) {
+                break;
+            }
+            written += 1;
+        }
+        written
+    }
+
+    pub fn remaining(&self) -> usize {
+        self.cap.saturating_sub(self.n)
+    }
+}
+
+/*
     Synchronization
 
 */
@@ -606,99 +702,6 @@ impl SyncQueue {
     }
 }
 
-pub struct CircBuf {
-    pub data: Vec<u8>,
-    pub head: usize,
-    pub tail: usize,
-    pub cap: usize,
-    pub n: usize,
-}
-impl CircBuf {
-    pub fn new(c: usize) -> Self {
-        Self {
-            data: vec![0u8; c],
-            head: 0,
-            tail: 0,
-            cap: c,
-            n: 0,
-        }
-    }
-    pub fn with_pos(c: usize, r: usize, w: usize) -> Self {
-        let n = if w >= r { w - r } else { c - r + w };
-        Self {
-            data: vec![0u8; c],
-            head: r,
-            tail: w,
-            cap: c,
-            n,
-        }
-    }
-    pub fn push(&mut self, v: u8) -> bool {
-        if self.n >= self.cap {
-            return false;
-        }
-        self.tail = self.tail.wrapping_add(1);
-        self.tail %= self.cap;
-        self.data[self.tail] = v;
-        self.n += 1;
-        true
-    }
-    pub fn pop(&mut self) -> Option<u8> {
-        if self.n == 0 {
-            return None;
-        }
-        self.head = self.head.wrapping_add(1);
-        self.head %= self.cap;
-        self.n -= 1;
-        Some(self.data[self.head])
-    }
-    pub fn len(&self) -> usize {
-        self.n
-    }
-    pub fn empty(&self) -> bool {
-        self.n == 0
-    }
-    pub fn full(&self) -> bool {
-        self.n >= self.cap
-    }
-
-    pub fn peek(&self) -> Option<u8> {
-        if self.n == 0 {
-            return None;
-        }
-        let i = self.head.wrapping_add(1) % self.cap;
-        if i >= self.data.len() {
-            return None;
-        }
-        Some(self.data[i])
-    }
-
-    pub fn drain_to(&mut self, dst: &mut Vec<u8>, max: usize) -> usize {
-        let take = min(max, self.n);
-        for _ in 0..take {
-            if let Some(b) = self.pop() {
-                dst.push(b);
-            }
-        }
-        take
-    }
-
-    pub fn fill_from(&mut self, src: &[u8]) -> usize {
-        let mut written = 0;
-        for &b in src {
-            if !self.push(b) {
-                break;
-            }
-            written += 1;
-        }
-        written
-    }
-
-    pub fn remaining(&self) -> usize {
-        self.cap.saturating_sub(self.n)
-    }
-}
-
 pub struct Channel {
     pub buf: Mutex<CircBuf>,
     pub guard: Spin,
@@ -734,131 +737,58 @@ impl Channel {
     }
     pub fn recv(&self) -> Option<u8> {
         self.guard.acquire();
-        let result = self.buf.lock().unwrap().pop();
-        if result.is_some() {
-            self.guard.release();
-            return result;
-        }
-        if self.is_closed() {
-            self.guard.release();
-            return None;
-        }
-        {
-            let data_ref = &self.buf;
-            {
-                let d = data_ref.lock().unwrap();
-                if d.n > 0 {
-                    drop(d);
-                } else {
-                    drop(d);
-                    let mut wq = self.wq.q.lock().unwrap();
-                    wq.push_back(thread::current());
-                    drop(wq);
-                    self.guard.release();
-                    thread::park();
-                    self.guard.acquire();
-                }
+        loop {
+            if let Some(byte) = self.buf.lock().unwrap().pop() {
+                self.guard.release();
+                return Some(byte);
             }
+            if self.is_closed() {
+                self.guard.release();
+                return None;
+            }
+            self.wq.q.lock().unwrap().push_back(thread::current());
+            self.guard.release();
+            thread::park();
+            self.guard.acquire();
         }
-        let result = self.buf.lock().unwrap().pop(); // [strange] If thread is waken and buf is empty again...
-        self.guard.release();
-        result
     }
     pub fn send(&self, v: u8) -> bool {
         let success = self.buf.lock().unwrap().push(v);
         if success {
-            let mut wq = self.wq.q.lock().unwrap();
-            if let Some(t) = wq.pop_front() {
-                t.unpark();
-            }
+            self.wq.signal();
         }
         success
     }
     pub fn close(&self) {
         self.shut.store(true, Ordering::Release);
-        let mut wq = self.wq.q.lock().unwrap();
-        while let Some(t) = wq.pop_front() {
-            t.unpark();
-        }
+        self.wq.broadcast();
     }
 
     pub fn try_recv(&self) -> Option<u8> {
-        if self
-            .guard
-            .v
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
+        if !self.guard.try_acquire() {
             return None;
         }
-        let r = {
-            let mut ring = self.buf.lock().unwrap();
-            if ring.n > 0 {
-                ring.head = ring.head.wrapping_add(1);
-                let idx = ring.head % ring.cap;
-                if idx < ring.data.len() {
-                    ring.n -= 1;
-                    Some(ring.data[idx])
-                } else {
-                    ring.head = ring.head.wrapping_sub(1);
-                    None
-                }
-            } else {
-                None
-            }
-        };
-        self.guard.v.store(false, Ordering::Release);
+        let r = self.buf.lock().unwrap().pop();
+        self.guard.release();
         r
     }
 
     pub fn send_batch(&self, data: &[u8]) -> usize {
         let mut ring = self.buf.lock().unwrap();
-        let mut written = 0;
-        let cap = ring.cap;
-        for &byte in data {
-            if ring.n >= cap {
-                break;
-            }
-            ring.tail = ring.tail.wrapping_add(1);
-            let idx = ring.tail % cap;
-            if idx >= ring.data.len() {
-                ring.tail = ring.tail.wrapping_sub(1);
-                break;
-            }
-            ring.data[idx] = byte;
-            ring.n += 1;
-            written += 1;
-        }
+        let mut written = ring.fill_from(data);
         if written > 0 {
-            drop(ring);
-            let mut wq = self.wq.q.lock().unwrap();
-            if let Some(t) = wq.pop_front() {
-                t.unpark();
-            }
+            self.wq.signal();
         }
         written
     }
 
     pub fn depth(&self) -> usize {
-        let ring = self.buf.lock().unwrap();
-        let n = ring.n;
-        n
+        self.buf.lock().unwrap().len()
     }
 
     pub fn drain_all(&self) -> Vec<u8> {
         let mut result = Vec::new();
-        let mut ring = self.buf.lock().unwrap();
-        while ring.n > 0 {
-            ring.head = ring.head.wrapping_add(1);
-            let idx = ring.head % ring.cap;
-            if idx < ring.data.len() {
-                result.push(ring.data[idx]);
-                ring.n -= 1;
-            } else {
-                ring.head = ring.head.wrapping_sub(1);
-                break;
-            }
-        }
+        self.buf.lock().unwrap().drain_to(&mut result, usize::MAX);
         result
     }
 
@@ -867,11 +797,9 @@ impl Channel {
     }
 
     pub fn remaining_capacity(&self) -> usize {
-        let ring = self.buf.lock().unwrap();
-        ring.cap.saturating_sub(ring.n)
+        self.buf.lock().unwrap().remaining()
     }
 }
-
 
 /*
     Slab Entry
