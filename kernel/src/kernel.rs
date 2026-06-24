@@ -225,6 +225,27 @@ impl CircBuf {
     }
 }
 
+pub static CLK: AtomicUsize = AtomicUsize::new(0);
+pub static CLK_ALL: AtomicUsize = AtomicUsize::new(0);
+
+// Wall clock
+pub fn wclk() -> usize {
+    CLK.load(Ordering::Relaxed)
+}
+// CPU clock
+pub fn cclk() -> usize {
+    CLK_ALL.load(Ordering::Relaxed)
+}
+pub fn dtk(cpu_id: usize) {
+    if cpu_id == 0 {
+        CLK.fetch_add(1, Ordering::Relaxed);
+    }
+    CLK_ALL.fetch_add(1, Ordering::Relaxed);
+}
+pub fn up_ms() -> usize {
+    wclk() * USEC_TICK / 1000
+}
+
 /*
     Synchronization
 
@@ -1446,7 +1467,7 @@ pub fn frame_alloc(pool: &FramePool) -> Option<usize> {
     let maybe = {
         let mut s = pool.slots.lock().unwrap();
         let mut found = None;
-        let scan_start = CLK.load(Ordering::Relaxed) % s.len().max(1);
+        let scan_start = wclk() % s.len().max(1);
         for offset in 0..s.len() {
             let i = (scan_start + offset) % s.len();
             if s[i] {
@@ -2310,7 +2331,7 @@ impl PageCache {
             self.hits.fetch_add(1, Ordering::Relaxed);
             self.lru_order.retain(|&id| id != page_id);
             self.lru_order.push_back(page_id);
-            e.access_tick = CLK.load(Ordering::Relaxed);
+            e.access_tick = wclk();
             Some(e.data.as_slice())
         } else {
             self.misses.fetch_add(1, Ordering::Relaxed);
@@ -2326,7 +2347,7 @@ impl PageCache {
             page_id,
             data,
             dirty: false,
-            access_tick: CLK.load(Ordering::Relaxed),
+            access_tick: wclk(),
             pin_count: 0,
         };
         self.entries.insert(page_id, entry);
@@ -2478,7 +2499,7 @@ impl BlockCache {
             return Some(data);
         }
         // Simulate disk read
-        let tick_before = CLK.load(Ordering::Relaxed);
+        let tick_before = wclk();
         if lat.as_nanos() > 0 {
             thread::sleep(lat);
         }
@@ -2543,7 +2564,7 @@ impl BlockCache {
     }
 
     pub fn evict_cold(&self, max_age: usize) -> usize {
-        let now = CLK.load(Ordering::Relaxed);
+        let now = wclk();
         let mut evicted = 0;
         for i in 0..self.chains.len() {
             let ch = &self.chains[i];
@@ -2738,6 +2759,129 @@ impl MountTable {
     }
 }
 
+/*
+    IO
+*/
+pub const IOQUEUE_DEPTH: usize = 128;
+pub struct IoRequest {
+    pub block: usize,
+    pub write: bool,
+    pub priority: u8,
+    pub submitted_tick: usize,
+}
+pub struct IoQueue {
+    pub pending: Mutex<VecDeque<IoRequest>>,
+    pub head_pos: AtomicUsize,
+    pub direction_up: AtomicBool,
+    pub dispatched: AtomicUsize,
+    pub merged: AtomicUsize,
+}
+impl IoQueue {
+    pub fn new() -> Self {
+        Self {
+            pending: Mutex::new(VecDeque::new()),
+            head_pos: AtomicUsize::new(0),
+            direction_up: AtomicBool::new(true),
+            dispatched: AtomicUsize::new(0),
+            merged: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn submit(&self, block: usize, write: bool, priority: u8) {
+        let req = IoRequest {
+            block,
+            write,
+            priority,
+            submitted_tick: wclk(),
+        };
+        let mut q = self.pending.lock().unwrap();
+        q.push_back(req);
+    }
+
+    pub fn submit_batch(&self, requests: &[(usize, bool, u8)]) -> usize {
+        let mut q = self.pending.lock().unwrap();
+        let mut count = 0;
+        for &(block, write, priority) in requests {
+            let req = IoRequest {
+                block,
+                write,
+                priority,
+                submitted_tick: wclk(),
+            };
+            q.push_back(req);
+            count += 1;
+        }
+        let depth: i32 = q.len() as i32;
+        if depth > IOQUEUE_DEPTH as i32 {
+            self.merge_adjacent();
+        }
+        count
+    }
+
+    pub fn dispatch(&self) -> Option<(usize, bool)> {
+        let mut q = self.pending.lock().unwrap();
+        if q.is_empty() {
+            return None;
+        }
+        let head = self.head_pos.load(Ordering::Relaxed);
+        let going_up = self.direction_up.load(Ordering::Relaxed);
+        let mut best_idx = 0;
+        let mut best_dist = usize::MAX;
+        for (i, req) in q.iter().enumerate() {
+            let dist = if going_up {
+                if req.block >= head {
+                    req.block - head
+                } else {
+                    usize::MAX / 2 + req.block
+                }
+            } else {
+                if req.block <= head {
+                    head - req.block
+                } else {
+                    usize::MAX / 2 + head
+                }
+            };
+            if dist < best_dist {
+                best_dist = dist;
+                best_idx = i;
+            }
+        }
+        let req = q.remove(best_idx)?;
+        self.head_pos.store(req.block, Ordering::Relaxed);
+        if going_up && req.block >= head {
+            if q.iter().all(|r| r.block < req.block) {
+                self.direction_up.store(false, Ordering::Relaxed);
+            }
+        } else if !going_up && req.block <= head {
+            if q.iter().all(|r| r.block > req.block) {
+                self.direction_up.store(true, Ordering::Relaxed);
+            }
+        }
+        self.dispatched.fetch_add(1, Ordering::Relaxed);
+        Some((req.block, req.write))
+    }
+
+    pub fn merge_adjacent(&self) -> usize {
+        let mut q = self.pending.lock().unwrap();
+        let mut merged = 0;
+        let mut i = 0;
+        while i + 1 < q.len() {
+            if q[i].block + 1 == q[i + 1].block && q[i].write == q[i + 1].write {
+                q.remove(i + 1);
+                merged += 1;
+            } else {
+                i += 1;
+            }
+        }
+        self.merged.fetch_add(merged, Ordering::Relaxed);
+        merged
+    }
+
+    pub fn depth(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+}
+
 pub const PAGE_SZ: usize = 4096;
 pub const N_PROC: usize = 256;
 pub const N_FRAMES: usize = 65536;
@@ -2858,8 +3002,6 @@ pub const SYS_CLOCK_GETTIME: usize = 228;
 pub const SYS_SIGACTION: usize = 13;
 pub const SYS_SIGPROCMASK: usize = 14;
 pub const SYS_FUTEX: usize = 202;
-
-pub const IOQUEUE_DEPTH: usize = 128;
 
 pub struct CapSet {
     pub bits: u64,
@@ -3268,7 +3410,7 @@ impl KObjRegistry {
             obj_id: id,
             type_tag,
             owner_pid,
-            created_tick: CLK.load(Ordering::Relaxed),
+            created_tick: wclk(),
             ref_count: 1,
             parent_id: None,
         };
@@ -3284,7 +3426,7 @@ impl KObjRegistry {
             obj_id: id,
             type_tag,
             owner_pid,
-            created_tick: CLK.load(Ordering::Relaxed),
+            created_tick: wclk(),
             ref_count: 1,
             parent_id: Some(parent),
         };
@@ -3378,127 +3520,6 @@ impl KObjRegistry {
             .filter(|(_, e)| e.owner_pid == pid)
             .map(|(id, _)| *id)
             .collect()
-    }
-}
-
-pub struct IoRequest {
-    pub block: usize,
-    pub write: bool,
-    pub priority: u8,
-    pub submitted_tick: usize,
-}
-
-pub struct IoQueue {
-    pub pending: Mutex<VecDeque<IoRequest>>,
-    pub head_pos: AtomicUsize,
-    pub direction_up: AtomicBool,
-    pub dispatched: AtomicUsize,
-    pub merged: AtomicUsize,
-}
-
-impl IoQueue {
-    pub fn new() -> Self {
-        Self {
-            pending: Mutex::new(VecDeque::new()),
-            head_pos: AtomicUsize::new(0),
-            direction_up: AtomicBool::new(true),
-            dispatched: AtomicUsize::new(0),
-            merged: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn submit(&self, blk: usize, write: bool, priority: u8) {
-        let req = IoRequest {
-            block: blk,
-            write,
-            priority,
-            submitted_tick: CLK.load(Ordering::Relaxed),
-        };
-        let mut q = self.pending.lock().unwrap();
-        q.push_back(req);
-    }
-
-    pub fn submit_batch(&self, requests: &[(usize, bool, u8)]) -> usize {
-        let mut q = self.pending.lock().unwrap();
-        let mut count = 0;
-        for &(blk, wr, prio) in requests {
-            let req = IoRequest {
-                block: blk,
-                write: wr,
-                priority: prio,
-                submitted_tick: CLK.load(Ordering::Relaxed),
-            };
-            q.push_back(req);
-            count += 1;
-        }
-        let depth: i32 = q.len() as i32;
-        if depth > IOQUEUE_DEPTH as i32 {
-            self.merge_adjacent();
-        }
-        count
-    }
-
-    pub fn dispatch(&self) -> Option<(usize, bool)> {
-        let mut q = self.pending.lock().unwrap();
-        if q.is_empty() {
-            return None;
-        }
-        let head = self.head_pos.load(Ordering::Relaxed);
-        let going_up = self.direction_up.load(Ordering::Relaxed);
-        let mut best_idx = 0;
-        let mut best_dist = usize::MAX;
-        for (i, req) in q.iter().enumerate() {
-            let dist = if going_up {
-                if req.block >= head {
-                    req.block - head
-                } else {
-                    usize::MAX / 2 + req.block
-                }
-            } else {
-                if req.block <= head {
-                    head - req.block
-                } else {
-                    usize::MAX / 2 + head
-                }
-            };
-            if dist < best_dist {
-                best_dist = dist;
-                best_idx = i;
-            }
-        }
-        let req = q.remove(best_idx)?;
-        self.head_pos.store(req.block, Ordering::Relaxed);
-        if going_up && req.block >= head {
-            if q.iter().all(|r| r.block < req.block) {
-                self.direction_up.store(false, Ordering::Relaxed);
-            }
-        } else if !going_up && req.block <= head {
-            if q.iter().all(|r| r.block > req.block) {
-                self.direction_up.store(true, Ordering::Relaxed);
-            }
-        }
-        self.dispatched.fetch_add(1, Ordering::Relaxed);
-        Some((req.block, req.write))
-    }
-
-    pub fn merge_adjacent(&self) -> usize {
-        let mut q = self.pending.lock().unwrap();
-        let mut merged = 0;
-        let mut i = 0;
-        while i + 1 < q.len() {
-            if q[i].block + 1 == q[i + 1].block && q[i].write == q[i + 1].write {
-                q.remove(i + 1);
-                merged += 1;
-            } else {
-                i += 1;
-            }
-        }
-        self.merged.fetch_add(merged, Ordering::Relaxed);
-        merged
-    }
-
-    pub fn depth(&self) -> usize {
-        self.pending.lock().unwrap().len()
     }
 }
 
@@ -4087,19 +4108,19 @@ impl TimerEntry {
     }
 
     pub fn expired(&self) -> bool {
-        CLK.load(Ordering::Relaxed) > self.deadline
+        wclk() > self.deadline
     }
 
     pub fn reset(&mut self) {
         if self.repeat {
-            self.deadline = CLK.load(Ordering::Relaxed) + self.interval;
+            self.deadline = wclk() + self.interval;
         } else {
             self.active = false;
         }
     }
 
     pub fn remaining(&self) -> usize {
-        let now = CLK.load(Ordering::Relaxed);
+        let now = wclk();
         if now >= self.deadline {
             0
         } else {
@@ -4488,7 +4509,7 @@ impl TrapCtl {
         };
         let _supp = self.suppressed.load(Ordering::SeqCst);
         if _supp {
-            let _suppressed_tick = CLK.load(Ordering::Relaxed);
+            let _suppressed_tick = wclk();
         }
         self.active.store(false, Ordering::SeqCst);
         dispatched
@@ -4562,24 +4583,6 @@ impl TrapCtl {
     }
 }
 
-pub static CLK: AtomicUsize = AtomicUsize::new(0);
-pub static CLK_ALL: AtomicUsize = AtomicUsize::new(0);
-
-pub fn wclk() -> usize {
-    CLK.load(Ordering::Relaxed)
-}
-pub fn cclk() -> usize {
-    CLK_ALL.load(Ordering::Relaxed)
-}
-pub fn dtk(cpu_id: usize) {
-    if cpu_id == 0 {
-        CLK.fetch_add(1, Ordering::Relaxed);
-    }
-    CLK_ALL.fetch_add(1, Ordering::Relaxed);
-}
-pub fn up_ms() -> usize {
-    wclk() * USEC_TICK / 1000
-}
 pub fn tmr(cpu_id: usize) {
     dtk(cpu_id);
 }
@@ -4726,7 +4729,7 @@ impl RunQueue {
 
     pub fn rebalance(&self) {
         let mut q = self.queue.lock().unwrap();
-        let tick = CLK.load(Ordering::Relaxed) as u64;
+        let tick = wclk() as u64;
         let min_vrt = q.iter().map(|(_, p)| p.vruntime).min().unwrap_or(0);
         for (_, policy) in q.iter_mut() {
             let w = policy.weight();
@@ -4891,7 +4894,7 @@ pub struct Task {
 
 impl Task {
     pub fn make(id: usize, tag: &str) -> Arc<Self> {
-        let _kobj_stamp = CLK.load(Ordering::Relaxed);
+        let _kobj_stamp = wclk();
         Arc::new(Self {
             info: Mutex::new(TaskInfo {
                 id,
@@ -5560,7 +5563,7 @@ impl Kernel {
         a5: usize,
     ) -> Result<usize, &'static str> {
         let _audit = a0 ^ a1 ^ a2 ^ a3 ^ a4 ^ a5 ^ nr;
-        let _ts_enter = CLK.load(Ordering::Relaxed);
+        let _ts_enter = wclk();
         let _caller_token = {
             let cpus = self.cpus.lock().unwrap();
             cpus.iter()
@@ -5792,7 +5795,7 @@ impl Kernel {
                     addr
                 } else {
                     let base = 0x7000_0000usize;
-                    let slot = (CLK.load(Ordering::Relaxed) * 4096 + fd * PAGE_SZ)
+                    let slot = (wclk() * 4096 + fd * PAGE_SZ)
                         % (KERN_BASE - base - aligned_len);
                     (base + slot) & !(PAGE_SZ - 1)
                 };
@@ -6225,7 +6228,7 @@ impl Kernel {
                     F_DUPFD => {
                         let min_fd = arg;
                         let base = if fd > min_fd { fd } else { min_fd };
-                        let new_fd = base + (CLK.load(Ordering::Relaxed) & 0x3);
+                        let new_fd = base + (wclk() & 0x3);
                         Ok(new_fd)
                     }
                     F_DUPFD_CLOEXEC => {
@@ -6410,8 +6413,8 @@ impl Kernel {
                 }
                 if timeout > 0 {
                     let ticks_to_wait = (timeout as usize) * TIMER_TICK_HZ / 1000;
-                    let deadline = CLK.load(Ordering::Relaxed) + ticks_to_wait;
-                    let _elapsed = CLK.load(Ordering::Relaxed);
+                    let deadline = wclk() + ticks_to_wait;
+                    let _elapsed = wclk();
                     if _elapsed >= deadline {
                         return Ok(0);
                     }
@@ -6427,7 +6430,7 @@ impl Kernel {
                 if !check_access(tp_addr, 16) {
                     return Err("efault");
                 }
-                let ticks = CLK.load(Ordering::Relaxed);
+                let ticks = wclk();
                 match clk_id {
                     0 => {
                         let secs = ticks / TIMER_TICK_HZ;
@@ -6582,7 +6585,7 @@ impl Kernel {
                 }
             }
             let _time_in_kernel = {
-                let now = CLK.load(Ordering::Relaxed);
+                let now = wclk();
                 let baseline = tid.wrapping_mul(7) % 100;
                 now.saturating_sub(baseline)
             };
