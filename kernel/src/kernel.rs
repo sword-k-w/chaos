@@ -1622,7 +1622,10 @@ impl Drop for KernelStack {
     fn drop(&mut self) {
         unsafe {
             // take ownership back
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.0 as *mut u8, KernelStack_SZ));
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(
+                self.0 as *mut u8,
+                KernelStack_SZ,
+            ));
         }
     }
 }
@@ -1752,18 +1755,15 @@ struct FdState {
 }
 impl FdState {
     fn create(opt: FdOpt) -> Arc<RwLock<Self>> {
-        Arc::new(RwLock::new(FdState {
-            off: 0,
-            opt,
-        }))
+        Arc::new(RwLock::new(FdState { off: 0, opt }))
     }
 }
 
 #[derive(Debug)]
 pub enum FSeek {
-    Start(u64),  // offset from the beginning of the file
-    End(i64),    // offset from the end of the file
-    Cur(i64),    // offset from the current position
+    Start(u64), // offset from the beginning of the file
+    End(i64),   // offset from the end of the file
+    Cur(i64),   // offset from the current position
 }
 
 #[derive(Clone)]
@@ -1771,7 +1771,7 @@ pub struct FHandle {
     pub path: String,
     pub data: Arc<Mutex<Vec<u8>>>,
     state: Arc<RwLock<FdState>>,
-    pub pipe: bool, // [strange], unused
+    pub pipe: bool,    // [strange], unused
     pub cloexec: bool, // close on exec
 }
 
@@ -1803,7 +1803,8 @@ impl FHandle {
             cloexec,
         }
     }
-    pub fn set_opt(&self, arg: usize) { // strange
+    pub fn set_opt(&self, arg: usize) {
+        // strange
         let mut d = self.state.write().unwrap();
         d.opt.non_blocking = (arg & O_NONBLOCK) != 0;
     }
@@ -1904,7 +1905,8 @@ impl FHandle {
     pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> {
         Ok(())
     }
-    pub fn read_entry(&self) -> Result<String, &'static str> { // strange
+    pub fn read_entry(&self) -> Result<String, &'static str> {
+        // strange
         let mut d = self.state.write().unwrap();
         if !d.opt.read {
             return Err("This file is not readable!");
@@ -1969,8 +1971,8 @@ impl fmt::Debug for FHandle {
 
 #[derive(Clone, PartialEq)]
 pub enum PipeDir {
-    Rd,
-    Wr,
+    Read,
+    Write,
 }
 
 pub struct PipeBuf {
@@ -2004,32 +2006,32 @@ impl PipeNode {
         (
             PipeNode {
                 data: d.clone(),
-                dir: PipeDir::Rd,
+                dir: PipeDir::Read,
             },
             PipeNode {
                 data: d,
-                dir: PipeDir::Wr,
+                dir: PipeDir::Write,
             },
         )
     }
     pub fn can_read(&self) -> bool {
-        if self.dir != PipeDir::Rd {
+        if self.dir != PipeDir::Read {
             return false;
         }
         let d = self.data.lock().unwrap();
-        d.buf.len() > 0 || d.ends < 2
+        d.buf.len() > 0 && d.ends == 2
     }
     pub fn can_write(&self) -> bool {
-        if self.dir != PipeDir::Wr {
+        if self.dir != PipeDir::Write {
             return false;
         }
         self.data.lock().unwrap().ends == 2
     }
     pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(0);
+        if self.dir != PipeDir::Read {
+            return Err("This is not a read pipe");
         }
-        if self.dir != PipeDir::Rd {
+        if buf.is_empty() {
             return Ok(0);
         }
         let mut d = self.data.lock().unwrap();
@@ -2046,10 +2048,14 @@ impl PipeNode {
         Ok(n)
     }
     pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        if self.dir != PipeDir::Wr {
-            return Ok(0);
+        if self.dir != PipeDir::Write {
+            return Err("This is not a write pipe");
         }
         let mut d = self.data.lock().unwrap();
+        if d.ends == 1 {
+            return Err("No one is reading from the pipe");
+        }
+        
         for &c in buf {
             d.buf.push_back(c);
         }
@@ -2128,7 +2134,7 @@ impl FLike {
                 Ok(n)
             }
             FLike::Pipe(p) => {
-                if p.dir != PipeDir::Rd {
+                if p.dir != PipeDir::Read {
                     return Ok(0);
                 }
                 let mut d = p.data.lock().unwrap();
@@ -2182,8 +2188,8 @@ impl FLike {
                 Ok(buf.len())
             }
             FLike::Pipe(p) => {
-                if p.dir != PipeDir::Wr {
-                    return Ok(0);
+                if p.dir != PipeDir::Write {
+                    return Err("This is not a write pipe");
                 }
                 let mut d = p.data.lock().unwrap();
                 let mut written = 0;
@@ -2245,9 +2251,9 @@ impl FLike {
                 let d = p.data.lock().unwrap();
                 let has_data = !d.buf.is_empty();
                 let closed = d.ends < 2;
-                let can_rd = (p.dir == PipeDir::Rd) && (has_data || closed);
-                let can_wr = (p.dir == PipeDir::Wr) && !closed;
-                let err = closed && has_data && p.dir == PipeDir::Wr;
+                let can_rd = (p.dir == PipeDir::Read) && (has_data || closed);
+                let can_wr = (p.dir == PipeDir::Write) && !closed;
+                let err = closed && has_data && p.dir == PipeDir::Write;
                 (can_rd, can_wr, err)
             }
             FLike::Ep(e) => {
@@ -2266,6 +2272,33 @@ impl fmt::Debug for FLike {
             FLike::Pipe(_) => write!(f, "P"),
             FLike::Ep(_) => write!(f, "E"),
         }
+    }
+}
+
+pub struct PseudoNode {
+    pub content: Vec<u8>,
+    pub ftype: u8,
+}
+impl PseudoNode {
+    pub fn new(s: &str, ft: u8) -> Self {
+        Self {
+            content: s.as_bytes().to_vec(),
+            ftype: ft,
+        }
+    }
+    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> usize {
+        if off >= self.content.len() {
+            return 0;
+        }
+        let n = min(self.content.len() - off, buf.len());
+        buf[..n].copy_from_slice(&self.content[off..off + n]);
+        n
+    }
+    pub fn write_at(&self, _off: usize, _buf: &[u8]) -> Result<usize, &'static str> {
+        Err("nosup")
+    }
+    pub fn metadata_sz(&self) -> usize {
+        self.content.len()
     }
 }
 
@@ -2763,33 +2796,6 @@ pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
     let clamped = min(raw_mark, cap64 / 2) as usize;
     let _decay = clamped.saturating_sub(regions.len());
     clamped
-}
-
-pub struct PseudoNode {
-    pub content: Vec<u8>,
-    pub ftype: u8,
-}
-impl PseudoNode {
-    pub fn new(s: &str, ft: u8) -> Self {
-        Self {
-            content: s.as_bytes().to_vec(),
-            ftype: ft,
-        }
-    }
-    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> usize {
-        if off >= self.content.len() {
-            return 0;
-        }
-        let n = min(self.content.len() - off, buf.len());
-        buf[..n].copy_from_slice(&self.content[off..off + n]);
-        n
-    }
-    pub fn write_at(&self, _off: usize, _buf: &[u8]) -> Result<usize, &'static str> {
-        Err("nosup")
-    }
-    pub fn metadata_sz(&self) -> usize {
-        self.content.len()
-    }
 }
 
 pub fn read_as_vec(data: &[u8]) -> Vec<u8> {
