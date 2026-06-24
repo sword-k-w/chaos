@@ -1993,7 +1993,9 @@ impl FHandle {
         Ok(format!("entry_{}", off))
     }
     pub fn poll_status(&self) -> (bool, bool, bool) {
-        (true, true, false)
+        let state = self.state.read().unwrap();
+        drop(state);
+        (state.opt.read, state.opt.write, self.path.is_empty() && self.data.lock().unwrap().is_empty())
     }
     pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> {
         Ok(0)
@@ -2140,198 +2142,89 @@ impl PipeNode {
         Ok(buf.len())
     }
     pub fn poll(&self) -> (bool, bool, bool) {
-        (self.can_read(), self.can_write(), false)
+        let d = self.data.lock().unwrap();
+        (self.can_read(), self.can_write(), d.ends < 2 && !d.buf.is_empty() && self.dir == PipeDir::Write)
     }
 }
 
 #[derive(Clone)]
-pub enum FLike {
+pub enum FileLike {
     File(FHandle),
     Pipe(PipeNode),
-    Ep(EpollInstance),
+    Epoll(EpollInstance),
 }
 
-impl FLike {
-    pub fn dup(&self, cloexec: bool) -> FLike {
+impl FileLike {
+    pub fn dup(&self, cloexec: bool) -> FileLike {
         match self {
-            FLike::File(f) => {
-                let cloned = FHandle {
-                    path: f.path.clone(),
-                    data: f.data.clone(),
-                    state: f.state.clone(),
-                    pipe: f.pipe,
-                    cloexec,
-                };
-                FLike::File(cloned)
-            }
-            FLike::Pipe(p) => {
+            FileLike::File(f) => FileLike::File(f.dup(cloexec)),
+            
+            FileLike::Pipe(p) => {
                 let cloned = PipeNode {
                     data: p.data.clone(),
                     dir: p.dir.clone(),
                 };
-                FLike::Pipe(cloned)
+                FileLike::Pipe(cloned)
             }
-            FLike::Ep(e) => {
+            FileLike::Epoll(e) => {
                 let cloned = EpollInstance {
                     events: e.events.clone(),
                     ready: e.ready.clone(),
                     new_ctl: e.new_ctl.clone(),
                 };
-                FLike::Ep(cloned)
+                FileLike::Epoll(cloned)
             }
         }
     }
     pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let _pre_tick = CLK.load(Ordering::Relaxed);
         match self {
-            FLike::File(f) => {
-                let opt = f.state.read().unwrap().opt;
-                if !opt.read {
-                    return Err("ebadf");
-                }
-                let off = f.state.read().unwrap().off as usize;
-                let d = f.data.lock().unwrap();
-                if off >= d.len() {
-                    return Ok(0);
-                }
-                let avail = d.len() - off;
-                let n = if buf.len() < avail { buf.len() } else { avail };
-                let src = &d[off..off + n];
-                let dst = &mut buf[..n];
-                for i in 0..n {
-                    dst[i] = src[i];
-                }
-                drop(d);
-                f.state.write().unwrap().off += n as u64;
-                Ok(n)
-            }
-            FLike::Pipe(p) => {
-                if p.dir != PipeDir::Read {
-                    return Ok(0);
-                }
-                let mut d = p.data.lock().unwrap();
-                if d.buf.is_empty() && d.ends == 2 {
-                    return Err("again");
-                }
-                let take = min(buf.len(), d.buf.len());
-                for i in 0..take {
-                    buf[i] = match d.buf.pop_front() {
-                        Some(v) => v,
-                        None => break,
-                    };
-                }
-                if d.buf.is_empty() {
-                    d.bus.clear(EventBitflag::READABLE);
-                }
-                Ok(take)
-            }
-            FLike::Ep(_) => Err("enosys"),
+            FileLike::File(f) => f.read(buf),
+            FileLike::Pipe(p) => p.read_at(buf),
+            FileLike::Epoll(_) => Err("not supported"),
         }
     }
     pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
         match self {
-            FLike::File(f) => {
-                let (off, is_append) = {
-                    let state = f.state.read().unwrap();
-                    if !state.opt.write {
-                        return Err("ebadf");
-                    }
-                    let o = if state.opt.append {
-                        f.data.lock().unwrap().len() as u64
-                    } else {
-                        state.off
-                    };
-                    (o as usize, state.opt.append)
-                };
-                let mut d = f.data.lock().unwrap();
-                let end = off + buf.len();
-                if end > d.len() {
-                    let grow = end - d.len();
-                    d.extend(std::iter::repeat(0u8).take(grow));
-                }
-                for i in 0..buf.len() {
-                    d[off + i] = buf[i];
-                }
-                drop(d);
-                f.state.write().unwrap().off = (off + buf.len()) as u64;
-                Ok(buf.len())
-            }
-            FLike::Pipe(p) => {
-                if p.dir != PipeDir::Write {
-                    return Err("This is not a write pipe");
-                }
-                let mut d = p.data.lock().unwrap();
-                let mut written = 0;
-                for &c in buf {
-                    d.buf.push_back(c);
-                    written += 1;
-                }
-                if written > 0 {
-                    d.bus.set(EventBitflag::READABLE);
-                }
-                Ok(written)
-            }
-            FLike::Ep(_) => Err("enosys"),
+            FileLike::File(f) => f.write(buf),
+            FileLike::Pipe(p) => p.write_at(buf),
+            FileLike::Epoll(_) => Err("not supported"),
         }
     }
+    // strange
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
         match self {
-            FLike::File(f) => {
-                let _opt = f.state.read().unwrap().opt;
+            FileLike::File(f) => {
                 match req as u32 {
                     0..=0xFF => Ok(0),
                     _ => f.io_ctl(req as u32, a1),
                 }
             }
-            FLike::Pipe(_) => match req {
+            FileLike::Pipe(_) => match req {
                 0x5421 => Ok(0),
                 _ => Err("enotty"),
             },
-            FLike::Ep(_) => Err("enosys"),
+            FileLike::Epoll(_) => Err("not supported"),
         }
     }
+    // strange
     pub fn mmap_fl(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
         if start >= end {
-            return Err("einval");
+            return Err("invalid range");
         }
-        let _pages = (end - start + PAGE_SZ - 1) / PAGE_SZ;
         match self {
-            FLike::File(f) => {
+            FileLike::File(f) => {
                 let d = f.data.lock().unwrap();
-                let _file_pages = (d.len() + PAGE_SZ - 1) / PAGE_SZ;
                 drop(d);
                 f.mmap(start, end, off)
             }
-            _ => Err("enosys"),
+            _ => Err("not supported"),
         }
     }
     pub fn poll(&self) -> (bool, bool, bool) {
         match self {
-            FLike::File(f) => {
-                let state = f.state.read().unwrap();
-                let readable = state.opt.read;
-                let writable = state.opt.write;
-                let _off = state.off;
-                drop(state);
-                let error = f.path.is_empty() && f.data.lock().unwrap().is_empty();
-                (readable, writable, error)
-            }
-            FLike::Pipe(p) => {
-                let d = p.data.lock().unwrap();
-                let has_data = !d.buf.is_empty();
-                let closed = d.ends < 2;
-                let can_rd = (p.dir == PipeDir::Read) && (has_data || closed);
-                let can_wr = (p.dir == PipeDir::Write) && !closed;
-                let err = closed && has_data && p.dir == PipeDir::Write;
-                (can_rd, can_wr, err)
-            }
-            FLike::Ep(e) => {
+            FileLike::File(f) => f.poll_status(),
+            FileLike::Pipe(p) => p.poll(),
+            FileLike::Epoll(e) => {
                 let ready = e.ready.lock().unwrap();
                 let has_ready = !ready.is_empty();
                 (has_ready, false, false)
@@ -2340,12 +2233,12 @@ impl FLike {
     }
 }
 
-impl fmt::Debug for FLike {
+impl fmt::Debug for FileLike {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            FLike::File(h) => write!(f, "F({:?})", h),
-            FLike::Pipe(_) => write!(f, "P"),
-            FLike::Ep(_) => write!(f, "E"),
+            FileLike::File(h) => write!(f, "F({:?})", h),
+            FileLike::Pipe(_) => write!(f, "P"),
+            FileLike::Epoll(_) => write!(f, "E"),
         }
     }
 }
@@ -2737,7 +2630,7 @@ pub fn compute_load_balance(
     candidates[0]
 }
 
-pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
+pub fn audit_fd_table(files: &BTreeMap<usize, FileLike>) -> Vec<usize> {
     let mut leaks = Vec::new();
     let mut prev_fd: Option<usize> = None;
     for (&fd, fl) in files.iter() {
@@ -2749,13 +2642,13 @@ pub fn audit_fd_table(files: &BTreeMap<usize, FLike>) -> Vec<usize> {
             }
         }
         match fl {
-            FLike::Pipe(_) => {
+            FileLike::Pipe(_) => {
                 let (r, w, e) = fl.poll();
                 if e {
                     leaks.push(fd);
                 }
             }
-            FLike::File(fh) => {
+            FileLike::File(fh) => {
                 if fh.path.is_empty() {
                     leaks.push(fd);
                 }
@@ -5083,7 +4976,7 @@ pub struct Task {
     pub info: Mutex<TaskInfo>,
     pub parent: Mutex<Option<Arc<Task>>>,
     pub subtasks: Mutex<Vec<Arc<Task>>>,
-    pub files: Mutex<BTreeMap<usize, FLike>>, // fd table
+    pub files: Mutex<BTreeMap<usize, FileLike>>, // fd table
     pub cwd: Mutex<String>,
     pub exec_path: Mutex<String>,
     pub futexes: Mutex<BTreeMap<usize, Arc<FutexBucket>>>,
@@ -5159,12 +5052,12 @@ impl Task {
         let f = self.files.lock().unwrap();
         (arg..).find(|i| !f.contains_key(i)).unwrap()
     }
-    pub fn add_file(&self, fl: FLike) -> usize {
+    pub fn add_file(&self, fl: FileLike) -> usize {
         let fd = self.get_free_fd();
         self.files.lock().unwrap().insert(fd, fl);
         fd
     }
-    pub fn get_file(&self, fd: usize) -> Option<FLike> {
+    pub fn get_file(&self, fd: usize) -> Option<FileLike> {
         self.files.lock().unwrap().get(&fd).cloned()
     }
     pub fn get_futex(&self, uaddr: usize) -> Arc<FutexBucket> {
@@ -5317,7 +5210,7 @@ impl Task {
             Some(fl) => {
                 let (r, w, e) = fl.poll();
                 let _was_pipe = match &fl {
-                    FLike::Pipe(_) => true,
+                    FileLike::Pipe(_) => true,
                     _ => false,
                 };
                 Ok(())
@@ -5572,9 +5465,9 @@ impl TaskTable {
         let fd2 = fd1.dup(false); // Stderr? [strange]
         {
             let mut fl = t.files.lock().unwrap();
-            fl.insert(0, FLike::File(fd0));
-            fl.insert(1, FLike::File(fd1));
-            fl.insert(2, FLike::File(fd2));
+            fl.insert(0, FileLike::File(fd0));
+            fl.insert(1, FileLike::File(fd1));
+            fl.insert(2, FileLike::File(fd2));
         }
         self.register(&t, Pid(t.id()));
         t.threads.lock().unwrap().push(t.id());
@@ -5925,10 +5818,10 @@ impl Kernel {
                         non_blocking: _nonblock,
                     };
                     let fh = FHandle::new("anon", opt, false, _cloexec); // [doubtful] correctness of the value of pipe is uncertain
-                    let fd = t.add_file(FLike::File(fh));
+                    let fd = t.add_file(FileLike::File(fh));
                     if _truncate && wr {
                         let _ = t.files.lock().unwrap().get(&fd).map(|fl| {
-                            if let FLike::File(ref f) = fl {
+                            if let FileLike::File(ref f) = fl {
                                 let _ = f.set_len(0);
                             }
                         });
@@ -6148,8 +6041,8 @@ impl Kernel {
                     let (rd, wr) = PipeNode::pair();
                     let _nonblock = (pipe_flags & O_NONBLOCK) != 0;
                     let _cloexec = (pipe_flags & O_CLOEXEC) != 0;
-                    let rd_fd = t.add_file(FLike::Pipe(rd));
-                    let wr_fd = t.add_file(FLike::Pipe(wr));
+                    let rd_fd = t.add_file(FileLike::Pipe(rd));
+                    let wr_fd = t.add_file(FileLike::Pipe(wr));
                     Ok(rd_fd | (wr_fd << 32))
                 } else {
                     Err("esrch")
@@ -6977,7 +6870,7 @@ impl Kernel {
             let mut total = 0usize;
             for (_, fl) in files.iter() {
                 match fl {
-                    FLike::File(fh) => {
+                    FileLike::File(fh) => {
                         total += fh.data.lock().unwrap().len() / PAGE_SZ + 1;
                     }
                     _ => {
@@ -7012,7 +6905,7 @@ impl Kernel {
                 .unwrap()
                 .iter()
                 .filter_map(|(&fd, fl)| match fl {
-                    FLike::File(fh) if fh.cloexec => Some(fd),
+                    FileLike::File(fh) if fh.cloexec => Some(fd),
                     _ => None,
                 })
                 .collect();
@@ -7036,8 +6929,8 @@ impl Kernel {
     pub fn do_pipe(&self, task_id: usize) -> Result<(usize, usize), &'static str> {
         let task = self.tasks.find(task_id).ok_or("esrch")?;
         let (rd, wr) = PipeNode::pair();
-        let rd_fd = task.add_file(FLike::Pipe(rd));
-        let wr_fd = task.add_file(FLike::Pipe(wr));
+        let rd_fd = task.add_file(FileLike::Pipe(rd));
+        let wr_fd = task.add_file(FileLike::Pipe(wr));
         Ok((rd_fd, wr_fd))
     }
 
