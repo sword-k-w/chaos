@@ -2760,7 +2760,7 @@ impl MountTable {
 }
 
 /*
-    IO
+    Disk IO
 */
 pub const IOQUEUE_DEPTH: usize = 128;
 pub struct IoRequest {
@@ -2838,7 +2838,7 @@ impl IoQueue {
                 if req.block <= head {
                     head - req.block
                 } else {
-                    usize::MAX / 2 + head
+                    usize::MAX - req.block
                 }
             };
             if dist < best_dist {
