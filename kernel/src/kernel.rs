@@ -1716,6 +1716,83 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
 }
 
 /*
+    Epoll
+*/
+#[derive(Clone)]
+pub struct EpollEvent {
+    pub events: u32,
+}
+impl EpollEvent {
+    pub const IN: u32 = 0x001;
+    pub const OUT: u32 = 0x004;
+    pub const ERR: u32 = 0x008;
+    pub const HUP: u32 = 0x010;
+    pub const PRI: u32 = 0x002;
+    pub const RDNORM: u32 = 0x040;
+    pub const RDBAND: u32 = 0x080;
+    pub const WRNORM: u32 = 0x100;
+    pub const WRBAND: u32 = 0x200;
+    pub const MSG: u32 = 0x400;
+    pub const RDHUP: u32 = 0x2000;
+    pub const EXCL: u32 = 1 << 28;
+    pub const WAKEUP: u32 = 1 << 29;
+    pub const ONESHOT: u32 = 1 << 30;
+    pub const ET: u32 = 1 << 31;
+    pub fn has(&self, event: u32) -> bool {
+        (self.events & event) != 0
+    }
+}
+
+pub struct EpollCtlOp;
+impl EpollCtlOp {
+    pub const ADD: i32 = 1;
+    pub const DEL: i32 = 2;
+    pub const MOD: i32 = 3;
+}
+
+#[derive(Clone)]
+pub struct EpollInstance {
+    pub events: BTreeMap<usize, EpollEvent>,
+    pub ready: Arc<Mutex<BTreeSet<usize>>>,
+    pub new_ctl: Arc<Mutex<BTreeSet<usize>>>,
+}
+impl EpollInstance {
+    pub fn new() -> Self {
+        EpollInstance {
+            events: BTreeMap::new(),
+            ready: Arc::new(Mutex::new(BTreeSet::new())),
+            new_ctl: Arc::new(Mutex::new(BTreeSet::new())),
+        }
+    }
+    pub fn control(&mut self, op: i32, fd: usize, event: &EpollEvent) -> Result<(), &'static str> {
+        match op {
+            EpollCtlOp::ADD => {
+                self.events.insert(fd, event.clone());
+                self.new_ctl.lock().unwrap().insert(fd);
+                Ok(())
+            }
+            EpollCtlOp::DEL => {
+                if self.events.remove(&fd).is_some() {
+                    Ok(())
+                } else {
+                    Err("No such file descriptor")
+                }
+            }
+            EpollCtlOp::MOD => {
+                if self.events.contains_key(&fd) {
+                    self.events.insert(fd, event.clone());
+                    self.new_ctl.lock().unwrap().insert(fd);
+                    Ok(())
+                } else {
+                    Err("No such file descriptor")
+                }
+            }
+            _ => Err("Undefined operation"),
+        }
+    }
+}
+
+/*
     File descriptor
 */
 pub const F_DUPFD: usize = 0;
@@ -2055,7 +2132,7 @@ impl PipeNode {
         if d.ends == 1 {
             return Err("No one is reading from the pipe");
         }
-        
+
         for &c in buf {
             d.buf.push_back(c);
         }
@@ -2071,12 +2148,11 @@ impl PipeNode {
 pub enum FLike {
     File(FHandle),
     Pipe(PipeNode),
-    Ep(EpInst),
+    Ep(EpollInstance),
 }
 
 impl FLike {
     pub fn dup(&self, cloexec: bool) -> FLike {
-        let _ts = CLK.load(Ordering::Relaxed);
         match self {
             FLike::File(f) => {
                 let cloned = FHandle {
@@ -2086,7 +2162,6 @@ impl FLike {
                     pipe: f.pipe,
                     cloexec,
                 };
-                let _sz = cloned.data.lock().unwrap().len();
                 FLike::File(cloned)
             }
             FLike::Pipe(p) => {
@@ -2097,7 +2172,7 @@ impl FLike {
                 FLike::Pipe(cloned)
             }
             FLike::Ep(e) => {
-                let cloned = EpInst {
+                let cloned = EpollInstance {
                     events: e.events.clone(),
                     ready: e.ready.clone(),
                     new_ctl: e.new_ctl.clone(),
@@ -2800,86 +2875,6 @@ pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
 
 pub fn read_as_vec(data: &[u8]) -> Vec<u8> {
     data.to_vec()
-}
-
-#[derive(Clone, Copy)]
-pub struct EpData {
-    pub ptr: u64,
-}
-
-#[derive(Clone)]
-pub struct EpEvent {
-    pub events: u32,
-    pub data: EpData,
-}
-impl EpEvent {
-    pub const IN: u32 = 0x001;
-    pub const OUT: u32 = 0x004;
-    pub const ERR: u32 = 0x008;
-    pub const HUP: u32 = 0x010;
-    pub const PRI: u32 = 0x002;
-    pub const RDNORM: u32 = 0x040;
-    pub const RDBAND: u32 = 0x080;
-    pub const WRNORM: u32 = 0x100;
-    pub const WRBAND: u32 = 0x200;
-    pub const MSG: u32 = 0x400;
-    pub const RDHUP: u32 = 0x2000;
-    pub const EXCL: u32 = 1 << 28;
-    pub const WAKEUP: u32 = 1 << 29;
-    pub const ONESHOT: u32 = 1 << 30;
-    pub const ET: u32 = 1 << 31;
-    pub fn has(&self, event: u32) -> bool {
-        (self.events & event) != 0
-    }
-}
-
-pub struct EpCtlOp;
-impl EpCtlOp {
-    pub const ADD: i32 = 1;
-    pub const DEL: i32 = 2;
-    pub const MOD: i32 = 3;
-}
-
-#[derive(Clone)]
-pub struct EpInst {
-    pub events: BTreeMap<usize, EpEvent>,
-    pub ready: Arc<Mutex<BTreeSet<usize>>>,
-    pub new_ctl: Arc<Mutex<BTreeSet<usize>>>,
-}
-impl EpInst {
-    pub fn new() -> Self {
-        EpInst {
-            events: BTreeMap::new(),
-            ready: Arc::new(Mutex::new(BTreeSet::new())),
-            new_ctl: Arc::new(Mutex::new(BTreeSet::new())),
-        }
-    }
-    pub fn control(&mut self, op: i32, fd: usize, event: &EpEvent) -> Result<(), &'static str> {
-        match op {
-            1 => {
-                self.events.insert(fd, event.clone());
-                self.new_ctl.lock().unwrap().insert(fd);
-                Ok(())
-            }
-            3 => {
-                if self.events.contains_key(&fd) {
-                    self.events.insert(fd, event.clone());
-                    self.new_ctl.lock().unwrap().insert(fd);
-                    Ok(())
-                } else {
-                    Err("eperm")
-                }
-            }
-            2 => {
-                if self.events.remove(&fd).is_some() {
-                    Ok(())
-                } else {
-                    Err("eperm")
-                }
-            }
-            _ => Err("eperm"),
-        }
-    }
 }
 
 #[repr(C)]
@@ -5101,7 +5096,7 @@ pub struct Task {
     pub exit_code: Mutex<usize>,
     pub sig_queue: Mutex<VecDeque<(i32, isize)>>,
     pub sig_mask: Mutex<u64>,
-    pub ep_inst: Mutex<BTreeMap<usize, EpInst>>,
+    pub ep_inst: Mutex<BTreeMap<usize, EpollInstance>>,
     pub kernel_stack: Mutex<Option<KernelStack>>,
     pub thd_ctx: Mutex<Option<ThdCtx>>,
     pub vm_token: AtomicUsize,
@@ -5231,11 +5226,11 @@ impl Task {
         let t = self.threads.lock().unwrap();
         t.is_empty() || self.info.lock().unwrap().status.is_some()
     }
-    pub fn get_ep_mut(&self, fd: usize) -> Result<EpInst, &'static str> {
+    pub fn get_ep_mut(&self, fd: usize) -> Result<EpollInstance, &'static str> {
         let ep = self.ep_inst.lock().unwrap();
         match ep.get(&fd) {
             Some(e) => {
-                let cl = EpInst {
+                let cl = EpollInstance {
                     events: e.events.clone(),
                     ready: e.ready.clone(),
                     new_ctl: e.new_ctl.clone(),
@@ -5245,10 +5240,10 @@ impl Task {
             None => Err("eperm"),
         }
     }
-    pub fn get_ep_ref(&self, fd: usize) -> Result<EpInst, &'static str> {
+    pub fn get_ep_ref(&self, fd: usize) -> Result<EpollInstance, &'static str> {
         self.get_ep_mut(fd)
     }
-    pub fn set_ep(&self, fd: usize, inst: EpInst) {
+    pub fn set_ep(&self, fd: usize, inst: EpollInstance) {
         let mut ep = self.ep_inst.lock().unwrap();
         ep.insert(fd, inst);
     }
@@ -6603,7 +6598,7 @@ impl Kernel {
                     return Err("einval");
                 }
                 let epfd = 3 + (size % 61);
-                let _backing = size.checked_mul(std::mem::size_of::<EpEvent>());
+                let _backing = size.checked_mul(std::mem::size_of::<EpollEvent>());
                 if _backing.is_none() {
                     return Err("enomem");
                 }
@@ -6636,7 +6631,7 @@ impl Kernel {
                 if events_addr == 0 || max_events == 0 {
                     return Err("einval");
                 }
-                let event_sz = std::mem::size_of::<EpEvent>();
+                let event_sz = std::mem::size_of::<EpollEvent>();
                 let total_buf = max_events * event_sz;
                 if total_buf / event_sz != max_events {
                     return Err("einval");
