@@ -1994,7 +1994,6 @@ impl FHandle {
     }
     pub fn poll_status(&self) -> (bool, bool, bool) {
         let state = self.state.read().unwrap();
-        drop(state);
         (state.opt.read, state.opt.write, self.path.is_empty() && self.data.lock().unwrap().is_empty())
     }
     pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> {
@@ -2268,6 +2267,48 @@ impl PseudoNode {
     pub fn metadata_sz(&self) -> usize {
         self.content.len()
     }
+}
+
+/*
+    Terminal
+*/
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct TerminalIOSetting {
+    pub input_flags: u32,
+    pub output_flags: u32,
+    pub control_flags: u32,
+    pub local_flags: u32,
+    pub line: u8,     // line discipline
+    pub cc: [u8; 32], // control characters
+    pub input_speed: u32,
+    pub output_speed: u32,
+}
+impl Default for TerminalIOSetting {
+    fn default() -> Self {
+        TerminalIOSetting {
+            input_flags: 0o66402,
+            output_flags: 0o5,
+            control_flags: 0o2277,
+            local_flags: 0o105073,
+            line: 0,
+            cc: [
+                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 255, 18, 15, 23, 22, 255, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0, 0, 0, 0, 0, 0,
+            ],
+            input_speed: 0,
+            output_speed: 0,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct WindowSize {
+    pub row: u16,
+    pub col: u16,
+    pub xpx: u16,
+    pub ypx: u16,
 }
 
 pub const PAGE_SZ: usize = 4096;
@@ -2770,44 +2811,6 @@ pub fn read_as_vec(data: &[u8]) -> Vec<u8> {
     data.to_vec()
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct TrmIO {
-    pub iflag: u32,
-    pub oflag: u32,
-    pub cflag: u32,
-    pub lflag: u32,
-    pub line: u8,
-    pub cc: [u8; 32],
-    pub ispeed: u32,
-    pub ospeed: u32,
-}
-impl Default for TrmIO {
-    fn default() -> Self {
-        TrmIO {
-            iflag: 0o66402,
-            oflag: 0o5,
-            cflag: 0o2277,
-            lflag: 0o105073,
-            line: 0,
-            cc: [
-                3, 28, 127, 21, 4, 0, 1, 0, 17, 19, 26, 255, 18, 15, 23, 22, 255, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0, 0, 0, 0, 0, 0,
-            ],
-            ispeed: 0,
-            ospeed: 0,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct WinSz {
-    pub row: u16,
-    pub col: u16,
-    pub xpx: u16,
-    pub ypx: u16,
-}
 
 pub struct PageCacheEntry {
     pub page_id: usize,
@@ -5983,13 +5986,13 @@ impl Kernel {
                 let arg = a2;
                 match cmd {
                     TCGETS => {
-                        if !check_access(arg, std::mem::size_of::<TrmIO>()) {
+                        if !check_access(arg, std::mem::size_of::<TerminalIOSetting>()) {
                             return Err("efault");
                         }
                         Ok(0)
                     }
                     TCSETS => {
-                        if !check_access(arg, std::mem::size_of::<TrmIO>()) {
+                        if !check_access(arg, std::mem::size_of::<TerminalIOSetting>()) {
                             return Err("efault");
                         }
                         Ok(0)
@@ -6007,7 +6010,7 @@ impl Kernel {
                         Ok(0)
                     }
                     TIOCGWINSZ => {
-                        if !check_access(arg, std::mem::size_of::<WinSz>()) {
+                        if !check_access(arg, std::mem::size_of::<WindowSize>()) {
                             return Err("efault");
                         }
                         Ok(0)
