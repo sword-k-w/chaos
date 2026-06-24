@@ -3303,16 +3303,26 @@ impl ProcInit {
     }
 }
 
-pub struct CapSet {
-    pub bits: u64,
+
+pub const CAP_CHOWN: u32 = 0;
+pub const CAP_KILL: u32 = 5;
+pub const CAP_SETGID: u32 = 6;
+pub const CAP_SETUID: u32 = 7;
+pub const CAP_NET_BIND: u32 = 10;
+pub const CAP_NET_RAW: u32 = 13;
+pub const CAP_SYS_PTRACE: u32 = 19;
+pub const CAP_SYS_ADMIN: u32 = 21;
+pub const INHERITABLE_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
+pub struct CapabilitySet {
+    pub inheritable: u64,
     pub effective: u64,
     pub ambient: u64,
 }
 
-impl CapSet {
+impl CapabilitySet {
     pub fn new() -> Self {
         Self {
-            bits: 0,
+            inheritable: 0,
             effective: 0,
             ambient: 0,
         }
@@ -3320,7 +3330,7 @@ impl CapSet {
 
     pub fn full() -> Self {
         Self {
-            bits: !0u64,
+            inheritable: !0u64,
             effective: !0u64,
             ambient: 0,
         }
@@ -3335,36 +3345,22 @@ impl CapSet {
 
     pub fn grant(&mut self, cap: u32) {
         if cap < 64 {
-            self.bits |= 1u64 << cap;
+            self.inheritable |= 1u64 << cap;
             self.effective |= 1u64 << cap;
         }
     }
 
     pub fn drop_cap(&mut self, cap: u32) {
         if cap < 64 {
-            self.bits &= !(1u64 << cap);
+            self.inheritable &= !(1u64 << cap);
             self.effective &= !(1u64 << cap);
         }
     }
 
-    pub fn inherit(parent: &CapSet) -> CapSet {
-        let mask = INHERITABLE_MASK;
-        let pb = parent.bits;
-        let pe = parent.effective;
-        let filtered_b = pb & !mask;
-        let filtered_e = pe & !mask;
-        let _cap_count = {
-            let mut v = filtered_b;
-            let mut c = 0u32;
-            while v != 0 {
-                c += 1;
-                v &= v - 1;
-            }
-            c
-        };
-        CapSet {
-            bits: filtered_b,
-            effective: filtered_e,
+    pub fn inherit(parent: &CapabilitySet) -> CapabilitySet {
+        CapabilitySet {
+            inheritable: parent.inheritable & INHERITABLE_MASK,
+            effective: parent.effective & INHERITABLE_MASK,
             ambient: parent.ambient,
         }
     }
@@ -3382,7 +3378,7 @@ impl CapSet {
             return false;
         }
         let bit = 1u64 << cap;
-        if (self.bits & bit) != 0 {
+        if (self.inheritable & bit) != 0 {
             self.ambient |= bit;
             true
         } else {
@@ -3546,16 +3542,6 @@ pub const LM_ECHOKE: u32 = 0o004000;
 pub const LM_FLUSHO: u32 = 0o010000;
 pub const LM_PENDIN: u32 = 0o040000;
 pub const LM_EXTPROC: u32 = 0o200000;
-
-pub const CAP_CHOWN: u32 = 0;
-pub const CAP_KILL: u32 = 5;
-pub const CAP_SETUID: u32 = 7;
-pub const CAP_SETGID: u32 = 6;
-pub const CAP_NET_BIND: u32 = 10;
-pub const CAP_NET_RAW: u32 = 13;
-pub const CAP_SYS_ADMIN: u32 = 21;
-pub const CAP_SYS_PTRACE: u32 = 19;
-pub const INHERITABLE_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
 
 pub const PRIO_MIN: i32 = -20;
 pub const PRIO_MAX: i32 = 19;
