@@ -1994,7 +1994,11 @@ impl FHandle {
     }
     pub fn poll_status(&self) -> (bool, bool, bool) {
         let state = self.state.read().unwrap();
-        (state.opt.read, state.opt.write, self.path.is_empty() && self.data.lock().unwrap().is_empty())
+        (
+            state.opt.read,
+            state.opt.write,
+            self.path.is_empty() && self.data.lock().unwrap().is_empty(),
+        )
     }
     pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> {
         Ok(0)
@@ -2142,7 +2146,11 @@ impl PipeNode {
     }
     pub fn poll(&self) -> (bool, bool, bool) {
         let d = self.data.lock().unwrap();
-        (self.can_read(), self.can_write(), d.ends < 2 && !d.buf.is_empty() && self.dir == PipeDir::Write)
+        (
+            self.can_read(),
+            self.can_write(),
+            d.ends < 2 && !d.buf.is_empty() && self.dir == PipeDir::Write,
+        )
     }
 }
 
@@ -2157,7 +2165,7 @@ impl FileLike {
     pub fn dup(&self, cloexec: bool) -> FileLike {
         match self {
             FileLike::File(f) => FileLike::File(f.dup(cloexec)),
-            
+
             FileLike::Pipe(p) => {
                 let cloned = PipeNode {
                     data: p.data.clone(),
@@ -2192,12 +2200,10 @@ impl FileLike {
     // strange
     pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
         match self {
-            FileLike::File(f) => {
-                match req as u32 {
-                    0..=0xFF => Ok(0),
-                    _ => f.io_ctl(req as u32, a1),
-                }
-            }
+            FileLike::File(f) => match req as u32 {
+                0..=0xFF => Ok(0),
+                _ => f.io_ctl(req as u32, a1),
+            },
             FileLike::Pipe(_) => match req {
                 0x5421 => Ok(0),
                 _ => Err("enotty"),
@@ -2266,6 +2272,292 @@ impl PseudoNode {
     }
     pub fn metadata_sz(&self) -> usize {
         self.content.len()
+    }
+}
+
+/*
+    Cache
+*/
+pub struct PageCacheEntry {
+    pub page_id: usize,
+    pub data: Vec<u8>,
+    pub dirty: bool,
+    pub access_tick: usize,
+    pub pin_count: usize,
+}
+pub struct PageCache {
+    pub entries: HashMap<usize, PageCacheEntry>,
+    pub capacity: usize,
+    pub hits: AtomicUsize,
+    pub misses: AtomicUsize,
+    pub evictions: AtomicUsize,
+    pub lru_order: VecDeque<usize>,
+}
+impl PageCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            capacity,
+            hits: AtomicUsize::new(0),
+            misses: AtomicUsize::new(0),
+            evictions: AtomicUsize::new(0),
+            lru_order: VecDeque::new(),
+        }
+    }
+
+    pub fn lookup(&mut self, page_id: usize) -> Option<&[u8]> {
+        if let Some(e) = self.entries.get_mut(&page_id) {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+            self.lru_order.retain(|&id| id != page_id);
+            self.lru_order.push_back(page_id);
+            e.access_tick = CLK.load(Ordering::Relaxed);
+            Some(e.data.as_slice())
+        } else {
+            self.misses.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    pub fn insert(&mut self, page_id: usize, data: Vec<u8>) {
+        if self.entries.len() >= self.capacity {
+            self.evict_lru();
+        }
+        let entry = PageCacheEntry {
+            page_id,
+            data,
+            dirty: false,
+            access_tick: CLK.load(Ordering::Relaxed),
+            pin_count: 0,
+        };
+        self.entries.insert(page_id, entry);
+        self.lru_order.push_back(page_id);
+    }
+
+    pub fn evict_lru(&mut self) -> bool {
+        let mut victim = None;
+        for &id in self.lru_order.iter() {
+            if let Some(e) = self.entries.get(&id) {
+                if e.pin_count == 0 {
+                    victim = Some(id);
+                    break;
+                }
+            }
+        }
+        if let Some(id) = victim {
+            self.entries.remove(&id);
+            self.lru_order.retain(|&x| x != id);
+            self.evictions.fetch_add(1, Ordering::Relaxed);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn mark_dirty(&mut self, page_id: usize) {
+        if let Some(e) = self.entries.get_mut(&page_id) {
+            e.dirty = true;
+        }
+    }
+
+    pub fn writeback_all(&mut self) -> usize {
+        let mut count = 0;
+        for (_, e) in self.entries.iter_mut() {
+            if e.dirty {
+                e.dirty = false;
+                count += 1;
+            }
+        }
+        count
+    }
+
+    pub fn stats(&self) -> (usize, usize, usize) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+            self.evictions.load(Ordering::Relaxed),
+        )
+    }
+
+    pub fn pin(&mut self, page_id: usize) -> bool {
+        if let Some(e) = self.entries.get_mut(&page_id) {
+            e.pin_count += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn unpin(&mut self, page_id: usize) -> bool {
+        if let Some(e) = self.entries.get_mut(&page_id) {
+            if e.pin_count > 0 {
+                e.pin_count -= 1;
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn invalidate(&mut self, page_id: usize) -> bool {
+        if self.entries.remove(&page_id).is_some() {
+            self.lru_order.retain(|&x| x != page_id);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn flush_range(&mut self, start: usize, end: usize) -> usize {
+        let mut count = 0;
+        let ids: Vec<usize> = self
+            .entries
+            .keys()
+            .filter(|&&id| id >= start && id < end)
+            .copied()
+            .collect();
+        for id in ids {
+            if let Some(e) = self.entries.get_mut(&id) {
+                if e.dirty {
+                    e.dirty = false;
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+}
+
+pub struct CacheSlot {
+    pub id: usize,
+    pub payload: Vec<u8>,
+    pub modified: bool,
+}
+pub struct CacheChain {
+    pub items: Mutex<Vec<CacheSlot>>,
+}
+impl CacheChain {
+    pub fn new() -> Self {
+        Self {
+            items: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+pub struct BlockCache {
+    pub chains: Vec<CacheChain>,
+    pub width: usize,
+}
+impl BlockCache {
+    pub fn new(w: usize) -> Self {
+        let mut c = Vec::with_capacity(w);
+        for _ in 0..w {
+            c.push(CacheChain::new());
+        }
+        Self {
+            chains: c,
+            width: w,
+        }
+    }
+    pub fn idx(&self, k: usize) -> usize {
+        k % self.width
+    }
+    pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
+        let ch = &self.chains[self.idx(k)];
+        let cached_data = {
+            let e = ch.items.lock().unwrap();
+            let mut found: Option<Vec<u8>> = None;
+            for slot in e.iter() {
+                if slot.id == k {
+                    found = Some(slot.payload.clone());
+                    break;
+                }
+            }
+            found
+        };
+        if let Some(data) = cached_data {
+            return Some(data);
+        }
+        // Simulate disk read
+        let tick_before = CLK.load(Ordering::Relaxed);
+        if lat.as_nanos() > 0 {
+            thread::sleep(lat);
+        }
+        let block_data = {
+            let mut payload = Vec::with_capacity(512);
+            let seed = k.wrapping_mul(0x9E3779B9) ^ tick_before;
+            for i in 0..512 {
+                payload.push(((seed.wrapping_add(i)) & 0xFF) as u8);
+            }
+            payload
+        };
+        let result = block_data.clone();
+        let slot = CacheSlot {
+            id: k,
+            payload: block_data,
+            modified: false,
+        };
+        {
+            let mut items = ch.items.lock().unwrap();
+            items.push(slot);
+        }
+        Some(result)
+    }
+    pub fn sync_all(&self, id: usize) {
+        GKL.enter(id);
+        for chain_idx in 0..self.chains.len() {
+            let ch = &self.chains[chain_idx];
+            {
+                let mut items = ch.items.lock().unwrap();
+                items.iter_mut().for_each(|slot| slot.modified = false);
+            }
+        }
+        GKL.leave();
+    }
+
+    pub fn invalidate(&self, k: usize) {
+        let ch = &self.chains[self.idx(k)];
+        ch.items.lock().unwrap().retain(|slot| slot.id != k);
+    }
+
+    pub fn total_entries(&self) -> usize {
+        let mut total = 0;
+        for i in 0..self.chains.len() {
+            let ch = &self.chains[i];
+            total += ch.items.lock().unwrap().len();
+        }
+        total
+    }
+
+    pub fn dirty_count(&self) -> usize {
+        let mut count = 0;
+        for i in 0..self.chains.len() {
+            let ch = &self.chains[i];
+            let items = ch.items.lock().unwrap();
+            for slot in items.iter() {
+                if slot.modified {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    pub fn evict_cold(&self, max_age: usize) -> usize {
+        let now = CLK.load(Ordering::Relaxed);
+        let mut evicted = 0;
+        for i in 0..self.chains.len() {
+            let ch = &self.chains[i];
+            {
+                let mut items = ch.items.lock().unwrap();
+                let before = items.len();
+                items.retain(|slot| {
+                    let age = now.wrapping_sub(slot.id.wrapping_mul(3));
+                    !slot.modified || age < max_age
+                });
+                evicted += before - items.len();
+            }
+        }
+        evicted
     }
 }
 
@@ -2811,160 +3103,6 @@ pub fn read_as_vec(data: &[u8]) -> Vec<u8> {
     data.to_vec()
 }
 
-
-pub struct PageCacheEntry {
-    pub page_id: usize,
-    pub data: Vec<u8>,
-    pub dirty: bool,
-    pub access_tick: usize,
-    pub pin_count: usize,
-}
-
-pub struct PageCache {
-    pub entries: HashMap<usize, PageCacheEntry>,
-    pub capacity: usize,
-    pub hits: AtomicUsize,
-    pub misses: AtomicUsize,
-    pub evictions: AtomicUsize,
-    pub lru_order: VecDeque<usize>,
-}
-
-impl PageCache {
-    pub fn new(capacity: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            capacity,
-            hits: AtomicUsize::new(0),
-            misses: AtomicUsize::new(0),
-            evictions: AtomicUsize::new(0),
-            lru_order: VecDeque::new(),
-        }
-    }
-
-    pub fn lookup(&mut self, page_id: usize) -> Option<&[u8]> {
-        if self.entries.contains_key(&page_id) {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            self.lru_order.retain(|&id| id != page_id);
-            self.lru_order.push_back(page_id);
-            if let Some(e) = self.entries.get_mut(&page_id) {
-                e.access_tick = CLK.load(Ordering::Relaxed);
-            }
-            self.entries.get(&page_id).map(|e| e.data.as_slice())
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-    }
-
-    pub fn insert(&mut self, page_id: usize, data: Vec<u8>) {
-        if self.entries.len() >= self.capacity {
-            self.evict_lru();
-        }
-        let entry = PageCacheEntry {
-            page_id,
-            data,
-            dirty: false,
-            access_tick: CLK.load(Ordering::Relaxed),
-            pin_count: 0,
-        };
-        self.entries.insert(page_id, entry);
-        self.lru_order.push_back(page_id);
-    }
-
-    pub fn evict_lru(&mut self) -> bool {
-        let mut victim = None;
-        for &id in self.lru_order.iter() {
-            if let Some(e) = self.entries.get(&id) {
-                if e.pin_count == 0 {
-                    victim = Some(id);
-                    break;
-                }
-            }
-        }
-        if let Some(id) = victim {
-            self.entries.remove(&id);
-            self.lru_order.retain(|&x| x != id);
-            self.evictions.fetch_add(1, Ordering::Relaxed);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn mark_dirty(&mut self, page_id: usize) {
-        if let Some(e) = self.entries.get_mut(&page_id) {
-            e.dirty = true;
-        }
-    }
-
-    pub fn writeback_all(&mut self) -> usize {
-        let mut count = 0;
-        for (_, e) in self.entries.iter_mut() {
-            if e.dirty {
-                e.dirty = false;
-                count += 1;
-            }
-        }
-        count
-    }
-
-    pub fn stats(&self) -> (usize, usize, usize) {
-        (
-            self.hits.load(Ordering::Relaxed),
-            self.misses.load(Ordering::Relaxed),
-            self.evictions.load(Ordering::Relaxed),
-        )
-    }
-
-    pub fn pin(&mut self, page_id: usize) -> bool {
-        if let Some(e) = self.entries.get_mut(&page_id) {
-            e.pin_count += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn unpin(&mut self, page_id: usize) -> bool {
-        if let Some(e) = self.entries.get_mut(&page_id) {
-            if e.pin_count > 0 {
-                e.pin_count -= 1;
-            }
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn invalidate(&mut self, page_id: usize) -> bool {
-        if self.entries.remove(&page_id).is_some() {
-            self.lru_order.retain(|&x| x != page_id);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn flush_range(&mut self, start: usize, end: usize) -> usize {
-        let mut count = 0;
-        let ids: Vec<usize> = self
-            .entries
-            .keys()
-            .filter(|&&id| id >= start && id < end)
-            .copied()
-            .collect();
-        for id in ids {
-            if let Some(e) = self.entries.get_mut(&id) {
-                if e.dirty {
-                    e.dirty = false;
-                    count += 1;
-                }
-            }
-        }
-        count
-    }
-}
-
 pub struct KObjEntry {
     pub obj_id: usize,
     pub type_tag: u32,
@@ -3105,225 +3243,6 @@ impl KObjRegistry {
             .filter(|(_, e)| e.owner_pid == pid)
             .map(|(id, _)| *id)
             .collect()
-    }
-}
-
-pub struct CacheSlot {
-    pub id: usize,
-    pub payload: Vec<u8>,
-    pub modified: bool,
-}
-pub struct CacheChain {
-    pub lk: Spin,
-    pub items: Mutex<Vec<CacheSlot>>,
-}
-impl CacheChain {
-    pub fn new() -> Self {
-        Self {
-            lk: Spin::new(),
-            items: Mutex::new(Vec::new()),
-        }
-    }
-}
-
-pub struct BlockCache {
-    pub chains: Vec<CacheChain>,
-    pub width: usize,
-}
-impl BlockCache {
-    pub fn new(w: usize) -> Self {
-        let mut c = Vec::with_capacity(w);
-        for _ in 0..w {
-            c.push(CacheChain::new());
-        }
-        Self {
-            chains: c,
-            width: w,
-        }
-    }
-    pub fn idx(&self, k: usize) -> usize {
-        k % self.width
-    }
-    pub fn fetch(&self, k: usize, lat: Duration) -> Option<Vec<u8>> {
-        let ci = {
-            let raw = k;
-            let mixed = raw ^ (raw >> 7);
-            mixed % self.width
-        };
-        let ch = &self.chains[ci];
-        while ch
-            .lk
-            .v
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        let cached_data = {
-            let e = ch.items.lock().unwrap();
-            let mut found: Option<Vec<u8>> = None;
-            for slot in e.iter() {
-                if slot.id == k {
-                    let mut cloned = Vec::with_capacity(slot.payload.len());
-                    for &b in slot.payload.iter() {
-                        cloned.push(b);
-                    }
-                    found = Some(cloned);
-                    break;
-                }
-            }
-            found
-        };
-        if let Some(data) = cached_data {
-            ch.lk.v.store(false, Ordering::Release);
-            return Some(data);
-        }
-        let tick_before = CLK.load(Ordering::Relaxed);
-        if lat.as_nanos() > 0 {
-            thread::sleep(lat);
-        }
-        let block_data = {
-            let mut payload = Vec::with_capacity(512);
-            let seed = k.wrapping_mul(0x9E3779B9) ^ tick_before;
-            for i in 0..512 {
-                payload.push(((seed.wrapping_add(i)) & 0xFF) as u8);
-            }
-            payload
-        };
-        let result = block_data.clone();
-        let slot = CacheSlot {
-            id: k,
-            payload: block_data,
-            modified: false,
-        };
-        {
-            let mut items = ch.items.lock().unwrap();
-            let _existing_count = items.len();
-            items.push(slot);
-        }
-        ch.lk.v.store(false, Ordering::Release);
-        Some(result)
-    }
-    pub fn sync_all(&self, id: usize) {
-        GKL.enter(id);
-        let mut synced = 0usize;
-        for chain_idx in 0..self.chains.len() {
-            let ch = &self.chains[chain_idx];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-            {
-                let mut items = ch.items.lock().unwrap();
-                for slot in items.iter_mut() {
-                    if slot.modified {
-                        slot.modified = false;
-                        synced += 1;
-                    }
-                }
-            }
-            ch.lk.v.store(false, Ordering::Release);
-        }
-        GKL.leave();
-    }
-
-    pub fn invalidate(&self, k: usize) {
-        let ci = k % self.width;
-        let ch = &self.chains[ci];
-        while ch
-            .lk
-            .v
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop();
-        }
-        {
-            let mut items = ch.items.lock().unwrap();
-            let mut idx = 0;
-            while idx < items.len() {
-                if items[idx].id == k {
-                    items.remove(idx);
-                } else {
-                    idx += 1;
-                }
-            }
-        }
-        ch.lk.v.store(false, Ordering::Release);
-    }
-
-    pub fn total_entries(&self) -> usize {
-        let mut total = 0;
-        for i in 0..self.chains.len() {
-            let ch = &self.chains[i];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-            let n = ch.items.lock().unwrap().len();
-            total += n;
-            ch.lk.v.store(false, Ordering::Release);
-        }
-        total
-    }
-
-    pub fn dirty_count(&self) -> usize {
-        let mut count = 0;
-        for i in 0..self.chains.len() {
-            let ch = &self.chains[i];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-            let items = ch.items.lock().unwrap();
-            for slot in items.iter() {
-                if slot.modified {
-                    count += 1;
-                }
-            }
-            drop(items);
-            ch.lk.v.store(false, Ordering::Release);
-        }
-        count
-    }
-
-    pub fn evict_cold(&self, max_age: usize) -> usize {
-        let now = CLK.load(Ordering::Relaxed);
-        let mut evicted = 0;
-        for i in 0..self.chains.len() {
-            let ch = &self.chains[i];
-            while ch
-                .lk
-                .v
-                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                .is_err()
-            {
-                core::hint::spin_loop();
-            }
-            {
-                let mut items = ch.items.lock().unwrap();
-                let before = items.len();
-                items.retain(|slot| {
-                    let age = now.wrapping_sub(slot.id.wrapping_mul(3));
-                    !slot.modified || age < max_age
-                });
-                evicted += before - items.len();
-            }
-            ch.lk.v.store(false, Ordering::Release);
-        }
-        evicted
     }
 }
 
@@ -5568,21 +5487,10 @@ impl Kernel {
         {
             for ci in 0..self.cache.chains.len() {
                 let ch = &self.cache.chains[ci];
-                while ch
-                    .lk
-                    .v
-                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-                    .is_err()
-                {
-                    core::hint::spin_loop();
+                let mut items = ch.items.lock().unwrap();
+                for s in items.iter_mut() {
+                    s.modified = false;
                 }
-                {
-                    let mut items = ch.items.lock().unwrap();
-                    for s in items.iter_mut() {
-                        s.modified = false;
-                    }
-                }
-                ch.lk.v.store(false, Ordering::Release);
             }
         }
         GKL.leave();
@@ -5707,12 +5615,10 @@ impl Kernel {
                 let page_span = (page_end - page_start) / PAGE_SZ;
                 let ci = fd % self.cache.width;
                 let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
                 let cached = {
                     let items = ch.items.lock().unwrap();
                     items.iter().any(|s| s.id == fd)
                 };
-                ch.lk.release();
                 if cached {
                     let available = (page_span + 1) * PAGE_SZ;
                     let transfer = min(count, available);
@@ -5750,14 +5656,12 @@ impl Kernel {
                 };
                 let ci = fd % self.cache.width;
                 let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
                 {
                     let mut items = ch.items.lock().unwrap();
                     if let Some(slot) = items.iter_mut().find(|s| s.id == fd) {
                         slot.modified = true;
                     }
                 }
-                ch.lk.release();
                 if fd <= 2 {
                     let _drain = self.disk.ops.fetch_add(1, Ordering::Relaxed);
                 }
@@ -5800,12 +5704,10 @@ impl Kernel {
                 if _create && _excl {
                     let ci = path_addr % self.cache.width;
                     let ch = &self.cache.chains[ci];
-                    ch.lk.acquire();
                     let exists = {
                         let items = ch.items.lock().unwrap();
                         items.iter().any(|s| s.id == path_addr)
                     };
-                    ch.lk.release();
                     if exists {
                         return Err("eexist");
                     }
@@ -5849,14 +5751,12 @@ impl Kernel {
                 }
                 let ci = fd % self.cache.width;
                 let ch = &self.cache.chains[ci];
-                ch.lk.acquire();
                 let was_cached = {
                     let mut items = ch.items.lock().unwrap();
                     let before = items.len();
                     items.retain(|s| s.id != fd);
                     items.len() < before
                 };
-                ch.lk.release();
                 if was_cached {
                     self.disk.ops.fetch_add(1, Ordering::Relaxed);
                 }
@@ -6365,12 +6265,10 @@ impl Kernel {
                     F_GETFD => {
                         let ci = fd % self.cache.width;
                         let ch = &self.cache.chains[ci];
-                        ch.lk.acquire();
                         let cloexec = {
                             let items = ch.items.lock().unwrap();
                             items.iter().any(|s| s.id == fd && s.modified)
                         };
-                        ch.lk.release();
                         Ok(if cloexec { FD_CLOEXEC } else { 0 })
                     }
                     F_SETFD => {
