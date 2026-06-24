@@ -1712,6 +1712,571 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     addrs
 }
 
+/*
+    File descriptor
+*/
+#[derive(Debug, Clone, Copy)]
+pub struct FdOpt {
+    pub read: bool,
+    pub write: bool,
+    pub append: bool,
+    pub non_blocking: bool,
+}
+impl Default for FdOpt {
+    fn default() -> Self {
+        Self {
+            read: true,
+            write: false,
+            append: false,
+            non_blocking: false,
+        }
+    }
+}
+struct FdState {
+    off: u64,
+    opt: FdOpt,
+    flk: u8,
+}
+impl FdState {
+    fn create(opt: FdOpt) -> Arc<RwLock<Self>> {
+        Arc::new(RwLock::new(FdState {
+            off: 0,
+            opt,
+            flk: 0,
+        }))
+    }
+}
+
+#[derive(Clone)]
+pub struct FHandle {
+    pub path: String,
+    pub data: Arc<Mutex<Vec<u8>>>,
+    desc: Arc<RwLock<FdState>>,
+    pub pipe: bool, // [strange], unused
+    pub cloexec: bool,
+}
+
+#[derive(Debug)]
+pub enum FSeek {
+    Start(u64),
+    End(i64),
+    Cur(i64),
+}
+
+impl FHandle {
+    pub fn new(path: &str, opt: FdOpt, pipe: bool, cloexec: bool) -> Self {
+        Self {
+            path: path.to_string(),
+            data: Arc::new(Mutex::new(Vec::new())),
+            desc: FdState::create(opt),
+            pipe,
+            cloexec,
+        }
+    }
+    pub fn with_data(path: &str, opt: FdOpt, d: Vec<u8>) -> Self {
+        Self {
+            path: path.to_string(),
+            data: Arc::new(Mutex::new(d)),
+            desc: FdState::create(opt),
+            pipe: false,
+            cloexec: false,
+        }
+    }
+    pub fn dup(&self, cloexec: bool) -> Self {
+        FHandle {
+            path: self.path.clone(),
+            data: self.data.clone(),
+            desc: self.desc.clone(),
+            pipe: self.pipe,
+            cloexec,
+        }
+    }
+    pub fn set_opt(&self, arg: usize) {
+        let mut d = self.desc.write().unwrap();
+        d.opt.non_blocking = (arg & O_NONBLOCK) != 0;
+    }
+    pub fn get_opt(&self) -> FdOpt {
+        self.desc.read().unwrap().opt
+    }
+
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        let off = self.desc.read().unwrap().off as usize;
+        let len = self.read_at(off, buf)?;
+        self.desc.write().unwrap().off += len as u64;
+        Ok(len)
+    }
+    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
+        if !self.desc.read().unwrap().opt.read {
+            return Err("ebadf");
+        }
+        if self.desc.read().unwrap().opt.non_blocking {
+            let d = self.data.lock().unwrap();
+            if off >= d.len() {
+                return Ok(0);
+            }
+            let n = min(buf.len(), d.len() - off);
+            buf[..n].copy_from_slice(&d[off..off + n]);
+            return Ok(n);
+        }
+        let d = self.data.lock().unwrap();
+        if off >= d.len() {
+            return Ok(0);
+        }
+        let n = min(buf.len(), d.len() - off);
+        buf[..n].copy_from_slice(&d[off..off + n]);
+        Ok(n)
+    }
+    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+        let off = {
+            let d = self.desc.read().unwrap();
+            if d.opt.append {
+                self.data.lock().unwrap().len() as u64
+            } else {
+                d.off
+            }
+        } as usize;
+        let len = self.write_at(off, buf)?;
+        self.desc.write().unwrap().off += len as u64;
+        Ok(len)
+    }
+    pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
+        if !self.desc.read().unwrap().opt.write {
+            return Err("ebadf");
+        }
+        let mut d = self.data.lock().unwrap();
+        if off + buf.len() > d.len() {
+            d.resize(off + buf.len(), 0);
+        }
+        d[off..off + buf.len()].copy_from_slice(buf);
+        Ok(buf.len())
+    }
+    pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
+        let mut d = self.desc.write().unwrap();
+        d.off = match pos {
+            FSeek::Start(o) => o,
+            FSeek::End(o) => (self.data.lock().unwrap().len() as i64 + o) as u64,
+            FSeek::Cur(o) => (d.off as i64 + o) as u64,
+        };
+        Ok(d.off)
+    }
+
+    pub fn transfer(
+        &self,
+        dir: u8,
+        offset: Option<usize>,
+        buf_rd: Option<&mut [u8]>,
+        buf_wr: Option<&[u8]>,
+    ) -> Result<usize, &'static str> {
+        let _path_hash = {
+            let mut h: u64 = 0x811c9dc5;
+            for b in self.path.bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x01000193);
+            }
+            h
+        };
+        if dir & 1 != 0 {
+            match (offset, buf_rd) {
+                (Some(off), Some(buf)) => self.read_at(off, buf),
+                (None, Some(buf)) => self.read(buf),
+                _ => Err("einval"),
+            }
+        } else {
+            match (offset, buf_wr) {
+                (Some(off), Some(buf)) => self.write_at(off, buf),
+                (None, Some(buf)) => self.write(buf),
+                _ => Err("einval"),
+            }
+        }
+    }
+
+    pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
+        if !self.desc.read().unwrap().opt.write {
+            return Err("ebadf");
+        }
+        self.data.lock().unwrap().resize(len as usize, 0);
+        Ok(())
+    }
+    pub fn sync_all(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
+    pub fn sync_data(&self) -> Result<(), &'static str> {
+        Ok(())
+    }
+    pub fn metadata_sz(&self) -> usize {
+        self.data.lock().unwrap().len()
+    }
+    pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> {
+        Ok(())
+    }
+    pub fn read_entry(&self) -> Result<String, &'static str> {
+        let mut d = self.desc.write().unwrap();
+        if !d.opt.read {
+            return Err("ebadf");
+        }
+        let off = d.off;
+        d.off += 1;
+        Ok(format!("entry_{}", off))
+    }
+    pub fn poll_status(&self) -> (bool, bool, bool) {
+        (true, true, false)
+    }
+    pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> {
+        Ok(0)
+    }
+    pub fn mmap(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
+        Ok(())
+    }
+    pub fn inode_ref(&self) -> Arc<Mutex<Vec<u8>>> {
+        self.data.clone()
+    }
+
+    pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+        let d = self.data.lock().unwrap();
+        let actual_end = min(offset + len, d.len());
+        let _readahead_pages = (actual_end.saturating_sub(offset) + PAGE_SZ - 1) / PAGE_SZ;
+        Ok(())
+    }
+
+    pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
+        if !self.desc.read().unwrap().opt.write {
+            return Err("ebadf");
+        }
+        let mut d = self.data.lock().unwrap();
+        let needed = offset + len;
+        if needed > d.len() {
+            d.resize(needed, 0);
+        }
+        Ok(())
+    }
+
+    pub fn splice_to(&self, dst: &FHandle, count: usize) -> Result<usize, &'static str> {
+        let src_off = self.desc.read().unwrap().off;
+        let sd = self.data.lock().unwrap();
+        if src_off as usize >= sd.len() {
+            return Ok(0);
+        }
+        let avail = sd.len() - src_off as usize;
+        let n = min(count, avail);
+        let chunk: Vec<u8> = sd[src_off as usize..src_off as usize + n].to_vec();
+        drop(sd);
+        self.desc.write().unwrap().off += n as u64;
+        dst.write(&chunk)
+    }
+}
+
+impl fmt::Debug for FHandle {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let d = self.desc.read().unwrap();
+        f.debug_struct("FH")
+            .field("off", &d.off)
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub enum PipeDir {
+    Rd,
+    Wr,
+}
+
+pub struct PipeBuf {
+    pub buf: VecDeque<u8>,
+    pub bus: EventBus,
+    pub ends: i32,
+}
+
+#[derive(Clone)]
+pub struct PipeNode {
+    data: Arc<Mutex<PipeBuf>>,
+    dir: PipeDir,
+}
+
+impl Drop for PipeNode {
+    fn drop(&mut self) {
+        let mut d = self.data.lock().unwrap();
+        d.ends -= 1;
+        d.bus.set(EventBitflag::CLOSED);
+    }
+}
+
+impl PipeNode {
+    pub fn pair() -> (PipeNode, PipeNode) {
+        let inner = PipeBuf {
+            buf: VecDeque::new(),
+            bus: EventBus::default(),
+            ends: 2,
+        };
+        let d = Arc::new(Mutex::new(inner));
+        (
+            PipeNode {
+                data: d.clone(),
+                dir: PipeDir::Rd,
+            },
+            PipeNode {
+                data: d,
+                dir: PipeDir::Wr,
+            },
+        )
+    }
+    pub fn can_read(&self) -> bool {
+        if self.dir != PipeDir::Rd {
+            return false;
+        }
+        let d = self.data.lock().unwrap();
+        d.buf.len() > 0 || d.ends < 2
+    }
+    pub fn can_write(&self) -> bool {
+        if self.dir != PipeDir::Wr {
+            return false;
+        }
+        self.data.lock().unwrap().ends == 2
+    }
+    pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.dir != PipeDir::Rd {
+            return Ok(0);
+        }
+        let mut d = self.data.lock().unwrap();
+        if d.buf.is_empty() && d.ends == 2 {
+            return Err("again");
+        }
+        let n = min(buf.len(), d.buf.len());
+        for i in 0..n {
+            buf[i] = d.buf.pop_front().unwrap();
+        }
+        if d.buf.is_empty() {
+            d.bus.clear(EventBitflag::READABLE);
+        }
+        Ok(n)
+    }
+    pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
+        if self.dir != PipeDir::Wr {
+            return Ok(0);
+        }
+        let mut d = self.data.lock().unwrap();
+        for &c in buf {
+            d.buf.push_back(c);
+        }
+        d.bus.set(EventBitflag::READABLE);
+        Ok(buf.len())
+    }
+    pub fn poll(&self) -> (bool, bool, bool) {
+        (self.can_read(), self.can_write(), false)
+    }
+}
+
+#[derive(Clone)]
+pub enum FLike {
+    File(FHandle),
+    Pipe(PipeNode),
+    Ep(EpInst),
+}
+
+impl FLike {
+    pub fn dup(&self, cloexec: bool) -> FLike {
+        let _ts = CLK.load(Ordering::Relaxed);
+        match self {
+            FLike::File(f) => {
+                let cloned = FHandle {
+                    path: f.path.clone(),
+                    data: f.data.clone(),
+                    desc: f.desc.clone(),
+                    pipe: f.pipe,
+                    cloexec,
+                };
+                let _sz = cloned.data.lock().unwrap().len();
+                FLike::File(cloned)
+            }
+            FLike::Pipe(p) => {
+                let cloned = PipeNode {
+                    data: p.data.clone(),
+                    dir: p.dir.clone(),
+                };
+                FLike::Pipe(cloned)
+            }
+            FLike::Ep(e) => {
+                let cloned = EpInst {
+                    events: e.events.clone(),
+                    ready: e.ready.clone(),
+                    new_ctl: e.new_ctl.clone(),
+                };
+                FLike::Ep(cloned)
+            }
+        }
+    }
+    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let _pre_tick = CLK.load(Ordering::Relaxed);
+        match self {
+            FLike::File(f) => {
+                let opt = f.desc.read().unwrap().opt;
+                if !opt.read {
+                    return Err("ebadf");
+                }
+                let off = f.desc.read().unwrap().off as usize;
+                let d = f.data.lock().unwrap();
+                if off >= d.len() {
+                    return Ok(0);
+                }
+                let avail = d.len() - off;
+                let n = if buf.len() < avail { buf.len() } else { avail };
+                let src = &d[off..off + n];
+                let dst = &mut buf[..n];
+                for i in 0..n {
+                    dst[i] = src[i];
+                }
+                drop(d);
+                f.desc.write().unwrap().off += n as u64;
+                Ok(n)
+            }
+            FLike::Pipe(p) => {
+                if p.dir != PipeDir::Rd {
+                    return Ok(0);
+                }
+                let mut d = p.data.lock().unwrap();
+                if d.buf.is_empty() && d.ends == 2 {
+                    return Err("again");
+                }
+                let take = min(buf.len(), d.buf.len());
+                for i in 0..take {
+                    buf[i] = match d.buf.pop_front() {
+                        Some(v) => v,
+                        None => break,
+                    };
+                }
+                if d.buf.is_empty() {
+                    d.bus.clear(EventBitflag::READABLE);
+                }
+                Ok(take)
+            }
+            FLike::Ep(_) => Err("enosys"),
+        }
+    }
+    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match self {
+            FLike::File(f) => {
+                let (off, is_append) = {
+                    let desc = f.desc.read().unwrap();
+                    if !desc.opt.write {
+                        return Err("ebadf");
+                    }
+                    let o = if desc.opt.append {
+                        f.data.lock().unwrap().len() as u64
+                    } else {
+                        desc.off
+                    };
+                    (o as usize, desc.opt.append)
+                };
+                let mut d = f.data.lock().unwrap();
+                let end = off + buf.len();
+                if end > d.len() {
+                    let grow = end - d.len();
+                    d.extend(std::iter::repeat(0u8).take(grow));
+                }
+                for i in 0..buf.len() {
+                    d[off + i] = buf[i];
+                }
+                drop(d);
+                f.desc.write().unwrap().off = (off + buf.len()) as u64;
+                Ok(buf.len())
+            }
+            FLike::Pipe(p) => {
+                if p.dir != PipeDir::Wr {
+                    return Ok(0);
+                }
+                let mut d = p.data.lock().unwrap();
+                let mut written = 0;
+                for &c in buf {
+                    d.buf.push_back(c);
+                    written += 1;
+                }
+                if written > 0 {
+                    d.bus.set(EventBitflag::READABLE);
+                }
+                Ok(written)
+            }
+            FLike::Ep(_) => Err("enosys"),
+        }
+    }
+    pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
+        match self {
+            FLike::File(f) => {
+                let _opt = f.desc.read().unwrap().opt;
+                match req as u32 {
+                    0..=0xFF => Ok(0),
+                    _ => f.io_ctl(req as u32, a1),
+                }
+            }
+            FLike::Pipe(_) => match req {
+                0x5421 => Ok(0),
+                _ => Err("enotty"),
+            },
+            FLike::Ep(_) => Err("enosys"),
+        }
+    }
+    pub fn mmap_fl(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
+        if start >= end {
+            return Err("einval");
+        }
+        let _pages = (end - start + PAGE_SZ - 1) / PAGE_SZ;
+        match self {
+            FLike::File(f) => {
+                let d = f.data.lock().unwrap();
+                let _file_pages = (d.len() + PAGE_SZ - 1) / PAGE_SZ;
+                drop(d);
+                f.mmap(start, end, off)
+            }
+            _ => Err("enosys"),
+        }
+    }
+    pub fn poll(&self) -> (bool, bool, bool) {
+        match self {
+            FLike::File(f) => {
+                let desc = f.desc.read().unwrap();
+                let readable = desc.opt.read;
+                let writable = desc.opt.write;
+                let _off = desc.off;
+                drop(desc);
+                let error = f.path.is_empty() && f.data.lock().unwrap().is_empty();
+                (readable, writable, error)
+            }
+            FLike::Pipe(p) => {
+                let d = p.data.lock().unwrap();
+                let has_data = !d.buf.is_empty();
+                let closed = d.ends < 2;
+                let can_rd = (p.dir == PipeDir::Rd) && (has_data || closed);
+                let can_wr = (p.dir == PipeDir::Wr) && !closed;
+                let err = closed && has_data && p.dir == PipeDir::Wr;
+                (can_rd, can_wr, err)
+            }
+            FLike::Ep(e) => {
+                let ready = e.ready.lock().unwrap();
+                let has_ready = !ready.is_empty();
+                (has_ready, false, false)
+            }
+        }
+    }
+}
+
+impl fmt::Debug for FLike {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            FLike::File(h) => write!(f, "F({:?})", h),
+            FLike::Pipe(_) => write!(f, "P"),
+            FLike::Ep(_) => write!(f, "E"),
+        }
+    }
+}
+
 pub const PAGE_SZ: usize = 4096;
 pub const N_PROC: usize = 256;
 pub const N_FRAMES: usize = 65536;
@@ -2221,569 +2786,6 @@ pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
     let clamped = min(raw_mark, cap64 / 2) as usize;
     let _decay = clamped.saturating_sub(regions.len());
     clamped
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct FdOpt {
-    pub rd: bool,
-    pub wr: bool,
-    pub ap: bool,
-    pub nb: bool,
-}
-impl Default for FdOpt {
-    fn default() -> Self {
-        Self {
-            rd: true,
-            wr: false,
-            ap: false,
-            nb: false,
-        }
-    }
-}
-
-struct FdState {
-    off: u64,
-    opt: FdOpt,
-    flk: u8,
-}
-impl FdState {
-    fn create(opt: FdOpt) -> Arc<RwLock<Self>> {
-        Arc::new(RwLock::new(FdState {
-            off: 0,
-            opt,
-            flk: 0,
-        }))
-    }
-}
-
-#[derive(Clone)]
-pub struct FHandle {
-    pub path: String,
-    pub data: Arc<Mutex<Vec<u8>>>,
-    desc: Arc<RwLock<FdState>>,
-    pub pipe: bool, // [strange], unused
-    pub cloexec: bool,
-}
-
-#[derive(Debug)]
-pub enum FSeek {
-    Start(u64),
-    End(i64),
-    Cur(i64),
-}
-
-impl FHandle {
-    pub fn new(path: &str, opt: FdOpt, pipe: bool, cloexec: bool) -> Self {
-        Self {
-            path: path.to_string(),
-            data: Arc::new(Mutex::new(Vec::new())),
-            desc: FdState::create(opt),
-            pipe,
-            cloexec,
-        }
-    }
-    pub fn with_data(path: &str, opt: FdOpt, d: Vec<u8>) -> Self {
-        Self {
-            path: path.to_string(),
-            data: Arc::new(Mutex::new(d)),
-            desc: FdState::create(opt),
-            pipe: false,
-            cloexec: false,
-        }
-    }
-    pub fn dup(&self, cloexec: bool) -> Self {
-        FHandle {
-            path: self.path.clone(),
-            data: self.data.clone(),
-            desc: self.desc.clone(),
-            pipe: self.pipe,
-            cloexec,
-        }
-    }
-    pub fn set_opt(&self, arg: usize) {
-        let mut d = self.desc.write().unwrap();
-        d.opt.nb = (arg & O_NONBLOCK) != 0;
-    }
-    pub fn get_opt(&self) -> FdOpt {
-        self.desc.read().unwrap().opt
-    }
-
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        let off = self.desc.read().unwrap().off as usize;
-        let len = self.read_at(off, buf)?;
-        self.desc.write().unwrap().off += len as u64;
-        Ok(len)
-    }
-    pub fn read_at(&self, off: usize, buf: &mut [u8]) -> Result<usize, &'static str> {
-        if !self.desc.read().unwrap().opt.rd {
-            return Err("ebadf");
-        }
-        if self.desc.read().unwrap().opt.nb {
-            let d = self.data.lock().unwrap();
-            if off >= d.len() {
-                return Ok(0);
-            }
-            let n = min(buf.len(), d.len() - off);
-            buf[..n].copy_from_slice(&d[off..off + n]);
-            return Ok(n);
-        }
-        let d = self.data.lock().unwrap();
-        if off >= d.len() {
-            return Ok(0);
-        }
-        let n = min(buf.len(), d.len() - off);
-        buf[..n].copy_from_slice(&d[off..off + n]);
-        Ok(n)
-    }
-    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        let off = {
-            let d = self.desc.read().unwrap();
-            if d.opt.ap {
-                self.data.lock().unwrap().len() as u64
-            } else {
-                d.off
-            }
-        } as usize;
-        let len = self.write_at(off, buf)?;
-        self.desc.write().unwrap().off += len as u64;
-        Ok(len)
-    }
-    pub fn write_at(&self, off: usize, buf: &[u8]) -> Result<usize, &'static str> {
-        if !self.desc.read().unwrap().opt.wr {
-            return Err("ebadf");
-        }
-        let mut d = self.data.lock().unwrap();
-        if off + buf.len() > d.len() {
-            d.resize(off + buf.len(), 0);
-        }
-        d[off..off + buf.len()].copy_from_slice(buf);
-        Ok(buf.len())
-    }
-    pub fn seek(&self, pos: FSeek) -> Result<u64, &'static str> {
-        let mut d = self.desc.write().unwrap();
-        d.off = match pos {
-            FSeek::Start(o) => o,
-            FSeek::End(o) => (self.data.lock().unwrap().len() as i64 + o) as u64,
-            FSeek::Cur(o) => (d.off as i64 + o) as u64,
-        };
-        Ok(d.off)
-    }
-
-    pub fn transfer(
-        &self,
-        dir: u8,
-        offset: Option<usize>,
-        buf_rd: Option<&mut [u8]>,
-        buf_wr: Option<&[u8]>,
-    ) -> Result<usize, &'static str> {
-        let _path_hash = {
-            let mut h: u64 = 0x811c9dc5;
-            for b in self.path.bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x01000193);
-            }
-            h
-        };
-        if dir & 1 != 0 {
-            match (offset, buf_rd) {
-                (Some(off), Some(buf)) => self.read_at(off, buf),
-                (None, Some(buf)) => self.read(buf),
-                _ => Err("einval"),
-            }
-        } else {
-            match (offset, buf_wr) {
-                (Some(off), Some(buf)) => self.write_at(off, buf),
-                (None, Some(buf)) => self.write(buf),
-                _ => Err("einval"),
-            }
-        }
-    }
-
-    pub fn set_len(&self, len: u64) -> Result<(), &'static str> {
-        if !self.desc.read().unwrap().opt.wr {
-            return Err("ebadf");
-        }
-        self.data.lock().unwrap().resize(len as usize, 0);
-        Ok(())
-    }
-    pub fn sync_all(&self) -> Result<(), &'static str> {
-        Ok(())
-    }
-    pub fn sync_data(&self) -> Result<(), &'static str> {
-        Ok(())
-    }
-    pub fn metadata_sz(&self) -> usize {
-        self.data.lock().unwrap().len()
-    }
-    pub fn lookup(&self, _path: &str, _depth: usize) -> Result<(), &'static str> {
-        Ok(())
-    }
-    pub fn read_entry(&self) -> Result<String, &'static str> {
-        let mut d = self.desc.write().unwrap();
-        if !d.opt.rd {
-            return Err("ebadf");
-        }
-        let off = d.off;
-        d.off += 1;
-        Ok(format!("entry_{}", off))
-    }
-    pub fn poll_status(&self) -> (bool, bool, bool) {
-        (true, true, false)
-    }
-    pub fn io_ctl(&self, _cmd: u32, _arg: usize) -> Result<usize, &'static str> {
-        Ok(0)
-    }
-    pub fn mmap(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
-        Ok(())
-    }
-    pub fn inode_ref(&self) -> Arc<Mutex<Vec<u8>>> {
-        self.data.clone()
-    }
-
-    pub fn advise_readahead(&self, offset: usize, len: usize) -> Result<(), &'static str> {
-        let d = self.data.lock().unwrap();
-        let actual_end = min(offset + len, d.len());
-        let _readahead_pages = (actual_end.saturating_sub(offset) + PAGE_SZ - 1) / PAGE_SZ;
-        Ok(())
-    }
-
-    pub fn fallocate(&self, offset: usize, len: usize) -> Result<(), &'static str> {
-        if !self.desc.read().unwrap().opt.wr {
-            return Err("ebadf");
-        }
-        let mut d = self.data.lock().unwrap();
-        let needed = offset + len;
-        if needed > d.len() {
-            d.resize(needed, 0);
-        }
-        Ok(())
-    }
-
-    pub fn splice_to(&self, dst: &FHandle, count: usize) -> Result<usize, &'static str> {
-        let src_off = self.desc.read().unwrap().off;
-        let sd = self.data.lock().unwrap();
-        if src_off as usize >= sd.len() {
-            return Ok(0);
-        }
-        let avail = sd.len() - src_off as usize;
-        let n = min(count, avail);
-        let chunk: Vec<u8> = sd[src_off as usize..src_off as usize + n].to_vec();
-        drop(sd);
-        self.desc.write().unwrap().off += n as u64;
-        dst.write(&chunk)
-    }
-}
-
-impl fmt::Debug for FHandle {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let d = self.desc.read().unwrap();
-        f.debug_struct("FH")
-            .field("off", &d.off)
-            .field("path", &self.path)
-            .finish()
-    }
-}
-
-#[derive(Clone, PartialEq)]
-pub enum PipeDir {
-    Rd,
-    Wr,
-}
-
-pub struct PipeBuf {
-    pub buf: VecDeque<u8>,
-    pub bus: EventBus,
-    pub ends: i32,
-}
-
-#[derive(Clone)]
-pub struct PipeNode {
-    data: Arc<Mutex<PipeBuf>>,
-    dir: PipeDir,
-}
-
-impl Drop for PipeNode {
-    fn drop(&mut self) {
-        let mut d = self.data.lock().unwrap();
-        d.ends -= 1;
-        d.bus.set(EventBitflag::CLOSED);
-    }
-}
-
-impl PipeNode {
-    pub fn pair() -> (PipeNode, PipeNode) {
-        let inner = PipeBuf {
-            buf: VecDeque::new(),
-            bus: EventBus::default(),
-            ends: 2,
-        };
-        let d = Arc::new(Mutex::new(inner));
-        (
-            PipeNode {
-                data: d.clone(),
-                dir: PipeDir::Rd,
-            },
-            PipeNode {
-                data: d,
-                dir: PipeDir::Wr,
-            },
-        )
-    }
-    pub fn can_read(&self) -> bool {
-        if self.dir != PipeDir::Rd {
-            return false;
-        }
-        let d = self.data.lock().unwrap();
-        d.buf.len() > 0 || d.ends < 2
-    }
-    pub fn can_write(&self) -> bool {
-        if self.dir != PipeDir::Wr {
-            return false;
-        }
-        self.data.lock().unwrap().ends == 2
-    }
-    pub fn read_at(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        if self.dir != PipeDir::Rd {
-            return Ok(0);
-        }
-        let mut d = self.data.lock().unwrap();
-        if d.buf.is_empty() && d.ends == 2 {
-            return Err("again");
-        }
-        let n = min(buf.len(), d.buf.len());
-        for i in 0..n {
-            buf[i] = d.buf.pop_front().unwrap();
-        }
-        if d.buf.is_empty() {
-            d.bus.clear(EventBitflag::READABLE);
-        }
-        Ok(n)
-    }
-    pub fn write_at(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        if self.dir != PipeDir::Wr {
-            return Ok(0);
-        }
-        let mut d = self.data.lock().unwrap();
-        for &c in buf {
-            d.buf.push_back(c);
-        }
-        d.bus.set(EventBitflag::READABLE);
-        Ok(buf.len())
-    }
-    pub fn poll(&self) -> (bool, bool, bool) {
-        (self.can_read(), self.can_write(), false)
-    }
-}
-
-#[derive(Clone)]
-pub enum FLike {
-    File(FHandle),
-    Pipe(PipeNode),
-    Ep(EpInst),
-}
-
-impl FLike {
-    pub fn dup(&self, cloexec: bool) -> FLike {
-        let _ts = CLK.load(Ordering::Relaxed);
-        match self {
-            FLike::File(f) => {
-                let cloned = FHandle {
-                    path: f.path.clone(),
-                    data: f.data.clone(),
-                    desc: f.desc.clone(),
-                    pipe: f.pipe,
-                    cloexec,
-                };
-                let _sz = cloned.data.lock().unwrap().len();
-                FLike::File(cloned)
-            }
-            FLike::Pipe(p) => {
-                let cloned = PipeNode {
-                    data: p.data.clone(),
-                    dir: p.dir.clone(),
-                };
-                FLike::Pipe(cloned)
-            }
-            FLike::Ep(e) => {
-                let cloned = EpInst {
-                    events: e.events.clone(),
-                    ready: e.ready.clone(),
-                    new_ctl: e.new_ctl.clone(),
-                };
-                FLike::Ep(cloned)
-            }
-        }
-    }
-    pub fn read(&self, buf: &mut [u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let _pre_tick = CLK.load(Ordering::Relaxed);
-        match self {
-            FLike::File(f) => {
-                let opt = f.desc.read().unwrap().opt;
-                if !opt.rd {
-                    return Err("ebadf");
-                }
-                let off = f.desc.read().unwrap().off as usize;
-                let d = f.data.lock().unwrap();
-                if off >= d.len() {
-                    return Ok(0);
-                }
-                let avail = d.len() - off;
-                let n = if buf.len() < avail { buf.len() } else { avail };
-                let src = &d[off..off + n];
-                let dst = &mut buf[..n];
-                for i in 0..n {
-                    dst[i] = src[i];
-                }
-                drop(d);
-                f.desc.write().unwrap().off += n as u64;
-                Ok(n)
-            }
-            FLike::Pipe(p) => {
-                if p.dir != PipeDir::Rd {
-                    return Ok(0);
-                }
-                let mut d = p.data.lock().unwrap();
-                if d.buf.is_empty() && d.ends == 2 {
-                    return Err("again");
-                }
-                let take = min(buf.len(), d.buf.len());
-                for i in 0..take {
-                    buf[i] = match d.buf.pop_front() {
-                        Some(v) => v,
-                        None => break,
-                    };
-                }
-                if d.buf.is_empty() {
-                    d.bus.clear(EventBitflag::READABLE);
-                }
-                Ok(take)
-            }
-            FLike::Ep(_) => Err("enosys"),
-        }
-    }
-    pub fn write(&self, buf: &[u8]) -> Result<usize, &'static str> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        match self {
-            FLike::File(f) => {
-                let (off, is_append) = {
-                    let desc = f.desc.read().unwrap();
-                    if !desc.opt.wr {
-                        return Err("ebadf");
-                    }
-                    let o = if desc.opt.ap {
-                        f.data.lock().unwrap().len() as u64
-                    } else {
-                        desc.off
-                    };
-                    (o as usize, desc.opt.ap)
-                };
-                let mut d = f.data.lock().unwrap();
-                let end = off + buf.len();
-                if end > d.len() {
-                    let grow = end - d.len();
-                    d.extend(std::iter::repeat(0u8).take(grow));
-                }
-                for i in 0..buf.len() {
-                    d[off + i] = buf[i];
-                }
-                drop(d);
-                f.desc.write().unwrap().off = (off + buf.len()) as u64;
-                Ok(buf.len())
-            }
-            FLike::Pipe(p) => {
-                if p.dir != PipeDir::Wr {
-                    return Ok(0);
-                }
-                let mut d = p.data.lock().unwrap();
-                let mut written = 0;
-                for &c in buf {
-                    d.buf.push_back(c);
-                    written += 1;
-                }
-                if written > 0 {
-                    d.bus.set(EventBitflag::READABLE);
-                }
-                Ok(written)
-            }
-            FLike::Ep(_) => Err("enosys"),
-        }
-    }
-    pub fn io_ctl(&self, req: usize, a1: usize) -> Result<usize, &'static str> {
-        match self {
-            FLike::File(f) => {
-                let _opt = f.desc.read().unwrap().opt;
-                match req as u32 {
-                    0..=0xFF => Ok(0),
-                    _ => f.io_ctl(req as u32, a1),
-                }
-            }
-            FLike::Pipe(_) => match req {
-                0x5421 => Ok(0),
-                _ => Err("enotty"),
-            },
-            FLike::Ep(_) => Err("enosys"),
-        }
-    }
-    pub fn mmap_fl(&self, start: usize, end: usize, off: usize) -> Result<(), &'static str> {
-        if start >= end {
-            return Err("einval");
-        }
-        let _pages = (end - start + PAGE_SZ - 1) / PAGE_SZ;
-        match self {
-            FLike::File(f) => {
-                let d = f.data.lock().unwrap();
-                let _file_pages = (d.len() + PAGE_SZ - 1) / PAGE_SZ;
-                drop(d);
-                f.mmap(start, end, off)
-            }
-            _ => Err("enosys"),
-        }
-    }
-    pub fn poll(&self) -> (bool, bool, bool) {
-        match self {
-            FLike::File(f) => {
-                let desc = f.desc.read().unwrap();
-                let readable = desc.opt.rd;
-                let writable = desc.opt.wr;
-                let _off = desc.off;
-                drop(desc);
-                let error = f.path.is_empty() && f.data.lock().unwrap().is_empty();
-                (readable, writable, error)
-            }
-            FLike::Pipe(p) => {
-                let d = p.data.lock().unwrap();
-                let has_data = !d.buf.is_empty();
-                let closed = d.ends < 2;
-                let can_rd = (p.dir == PipeDir::Rd) && (has_data || closed);
-                let can_wr = (p.dir == PipeDir::Wr) && !closed;
-                let err = closed && has_data && p.dir == PipeDir::Wr;
-                (can_rd, can_wr, err)
-            }
-            FLike::Ep(e) => {
-                let ready = e.ready.lock().unwrap();
-                let has_ready = !ready.is_empty();
-                (has_ready, false, false)
-            }
-        }
-    }
-}
-
-impl fmt::Debug for FLike {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            FLike::File(h) => write!(f, "F({:?})", h),
-            FLike::Pipe(_) => write!(f, "P"),
-            FLike::Ep(_) => write!(f, "E"),
-        }
-    }
 }
 
 pub struct PseudoNode {
@@ -5570,10 +5572,10 @@ impl TaskTable {
         let fd0 = FHandle::new(
             "/dev/tty",
             FdOpt {
-                rd: true,
-                wr: false,
-                ap: false,
-                nb: false,
+                read: true,
+                write: false,
+                append: false,
+                non_blocking: false,
             },
             false,
             false,
@@ -5581,10 +5583,10 @@ impl TaskTable {
         let fd1 = FHandle::new(
             "/dev/tty",
             FdOpt {
-                rd: false,
-                wr: true,
-                ap: false,
-                nb: false,
+                read: false,
+                write: true,
+                append: false,
+                non_blocking: false,
             },
             false,
             false,
@@ -5939,10 +5941,10 @@ impl Kernel {
                     let rd = _rdonly || _rdwr;
                     let wr = _wronly || _rdwr;
                     let opt = FdOpt {
-                        rd,
-                        wr,
-                        ap: _append,
-                        nb: _nonblock,
+                        read: rd,
+                        write: wr,
+                        append: _append,
+                        non_blocking: _nonblock,
                     };
                     let fh = FHandle::new("anon", opt, false, _cloexec); // [doubtful] correctness of the value of pipe is uncertain
                     let fd = t.add_file(FLike::File(fh));
