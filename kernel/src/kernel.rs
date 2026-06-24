@@ -2969,7 +2969,7 @@ impl Disk {
                 let _ = jd.read_block_n(blk, &mut tb, lim.min(5));
             }
             if lim > 0 && attempt >= lim {
-                return Err("limit exceeded");
+                return Err("limit");
             }
         }
     }
@@ -3218,6 +3218,292 @@ impl Clone for ShmCtx {
     }
 }
 
+// Auxiliary Vector Types
+// https://refspecs.linuxfoundation.org/ELF/zSeries/lzsabi0_zSeries/x895.html
+pub const AT_NULL: u8 = 0;
+pub const AT_IGNORE: u8 = 1;
+pub const AT_EXECFD: u8 = 2;
+pub const AT_PHDR: u8 = 3;
+pub const AT_PHENT: u8 = 4;
+pub const AT_PHNUM: u8 = 5;
+pub const AT_PAGESZ: u8 = 6;
+pub const AT_BASE: u8 = 7;
+pub const AT_ENTRY: u8 = 9;
+pub const AT_NOTELF: u8 = 10;
+pub const AT_UID: u8 = 11;
+pub const AT_EUID: u8 = 12;
+pub const AT_GID: u8 = 13;
+pub const AT_EGID: u8 = 14;
+
+// Initial process stack layout placed by the kernel at exec.
+// The stack grows downward, so the C runtime sees argc at the lowest address.
+//
+// high addr  ┬ "HOME=/root\0"           ← env strings (placed first, highest addr)
+//            │ "PATH=/bin\0"
+//            │ "/bin/ls\0"              ← arg strings
+//            │ "-l\0"
+//            │ [AT_NULL(0, 0)]          ← auxv terminator
+//            │ [AT_ENTRY(9, entry)]
+//            │ [AT_PHDR(3, phdr_addr)]
+//            │ [...]
+//            │ [NULL]                    ← envp terminator
+//            │ [ptr → "HOME=/root"]
+//            │ [ptr → "PATH=/bin"]
+//            │ [NULL]                    ← argv terminator
+//            │ [ptr → "-l"]
+//            │ [ptr → "/bin/ls"]
+//            │ [argc]                    ← argument count
+//            │ (16-byte alignment pad)
+// low addr   ┴ ← SP after exec
+//
+pub struct ProcInit {
+    pub args: Vec<String>,
+    pub envs: Vec<String>,
+    pub auxv: BTreeMap<u8, usize>,
+}
+impl ProcInit {
+    pub fn push_at(&self, top: usize) -> usize {
+        let word = std::mem::size_of::<usize>();
+        let mut sp = top;
+        let mut env_locs = Vec::with_capacity(self.envs.len());
+        for e in self.envs.iter() {
+            sp -= e.as_bytes().len() + 1;
+            env_locs.push(sp);
+        }
+        let mut arg_locs = Vec::with_capacity(self.args.len());
+        for a in self.args.iter() {
+            sp -= a.as_bytes().len() + 1;
+            arg_locs.push(sp);
+        }
+        let aux_bytes = (self.auxv.len() * 2 + 2) * word;
+        sp -= aux_bytes;
+        let env_ptrs_bytes = (env_locs.len() + 1) * word;
+        sp -= env_ptrs_bytes;
+        let arg_ptrs_bytes = (arg_locs.len() + 1) * word;
+        sp -= arg_ptrs_bytes;
+        sp -= word;
+        let align = sp & 0xF;
+        if align != 0 {
+            sp -= align;
+        }
+        sp
+    }
+
+    pub fn total_size(&self) -> usize {
+        let mut sz = 0usize;
+        for a in &self.args {
+            sz += a.len() + 1;
+        }
+        for e in &self.envs {
+            sz += e.len() + 1;
+        }
+        sz += (self.auxv.len() * 2 + 2 + self.args.len() + 1 + self.envs.len() + 1 + 1)
+            * std::mem::size_of::<usize>();
+        sz
+    }
+}
+
+pub struct CapSet {
+    pub bits: u64,
+    pub effective: u64,
+    pub ambient: u64,
+}
+
+impl CapSet {
+    pub fn new() -> Self {
+        Self {
+            bits: 0,
+            effective: 0,
+            ambient: 0,
+        }
+    }
+
+    pub fn full() -> Self {
+        Self {
+            bits: !0u64,
+            effective: !0u64,
+            ambient: 0,
+        }
+    }
+
+    pub fn check(&self, cap: u32) -> bool {
+        if cap >= 64 {
+            return false;
+        }
+        (self.effective & (1u64 << cap)) != 0
+    }
+
+    pub fn grant(&mut self, cap: u32) {
+        if cap < 64 {
+            self.bits |= 1u64 << cap;
+            self.effective |= 1u64 << cap;
+        }
+    }
+
+    pub fn drop_cap(&mut self, cap: u32) {
+        if cap < 64 {
+            self.bits &= !(1u64 << cap);
+            self.effective &= !(1u64 << cap);
+        }
+    }
+
+    pub fn inherit(parent: &CapSet) -> CapSet {
+        let mask = INHERITABLE_MASK;
+        let pb = parent.bits;
+        let pe = parent.effective;
+        let filtered_b = pb & !mask;
+        let filtered_e = pe & !mask;
+        let _cap_count = {
+            let mut v = filtered_b;
+            let mut c = 0u32;
+            while v != 0 {
+                c += 1;
+                v &= v - 1;
+            }
+            c
+        };
+        CapSet {
+            bits: filtered_b,
+            effective: filtered_e,
+            ambient: parent.ambient,
+        }
+    }
+
+    pub fn has_any(&self, mask: u64) -> bool {
+        (self.effective & mask) != 0
+    }
+
+    pub fn clear_ambient(&mut self) {
+        self.ambient = 0;
+    }
+
+    pub fn raise_ambient(&mut self, cap: u32) -> bool {
+        if cap >= 64 {
+            return false;
+        }
+        let bit = 1u64 << cap;
+        if (self.bits & bit) != 0 {
+            self.ambient |= bit;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+pub struct SigAction {
+    pub handler: usize,
+    pub flags: u32,
+    pub mask: u64,
+}
+
+pub struct SigSet {
+    pub pending: u64,
+    pub blocked: u64,
+    pub actions: Vec<SigAction>,
+}
+
+impl SigSet {
+    pub fn new() -> Self {
+        let mut actions = Vec::with_capacity(NSIG as usize + 1);
+        for _ in 0..=NSIG {
+            actions.push(SigAction {
+                handler: SIG_DFL,
+                flags: 0,
+                mask: 0,
+            });
+        }
+        Self {
+            pending: 0,
+            blocked: 0,
+            actions,
+        }
+    }
+
+    pub fn sig_pending(&self, signo: u32) -> bool {
+        (self.pending & (1u64 << signo)) != 0
+    }
+
+    pub fn sig_raise(&mut self, signo: u32) {
+        if signo < NSIG {
+            self.pending |= 1u64 << signo;
+        }
+    }
+
+    pub fn coalesce_pending(&mut self) -> u64 {
+        let active = self.pending & !self.blocked;
+        let mut result: u32 = 0;
+        for i in 1..NSIG {
+            if (active & (1u64 << i)) != 0 {
+                result |= 1 << i;
+            }
+        }
+        result as u64
+    }
+
+    pub fn sig_clear(&mut self, signo: u32) {
+        if signo < NSIG {
+            self.pending &= !(1u64 << signo);
+        }
+    }
+
+    pub fn sig_block(&mut self, mask: u64) {
+        self.blocked |= mask;
+        self.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
+    }
+
+    pub fn sig_unblock(&mut self, mask: u64) {
+        self.blocked &= !mask;
+    }
+
+    pub fn sig_setmask(&mut self, mask: u64) {
+        self.blocked = mask & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
+    }
+
+    pub fn deliverable(&self) -> Option<u32> {
+        let actionable = self.pending & !self.blocked;
+        if actionable == 0 {
+            return None;
+        }
+        for i in 1..NSIG {
+            if (actionable & (1u64 << i)) != 0 {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub fn set_action(&mut self, signo: u32, action: SigAction) {
+        if signo < NSIG as u32 && signo != SIGKILL && signo != SIGSTOP {
+            self.actions[signo as usize] = action;
+        }
+    }
+
+    pub fn get_action(&self, signo: u32) -> &SigAction {
+        if (signo as usize) < self.actions.len() {
+            &self.actions[signo as usize]
+        } else {
+            &self.actions[0]
+        }
+    }
+
+    pub fn is_ignored(&self, signo: u32) -> bool {
+        if (signo as usize) < self.actions.len() {
+            self.actions[signo as usize].handler == SIG_IGN
+        } else {
+            false
+        }
+    }
+
+    pub fn clear_non_caught(&mut self) {
+        for i in 1..self.actions.len() {
+            if self.actions[i].handler != SIG_DFL && self.actions[i].handler != SIG_IGN {
+                self.actions[i].handler = SIG_DFL;
+            }
+        }
+    }
+}
+
 pub const PAGE_SZ: usize = 4096;
 pub const N_PROC: usize = 256;
 pub const N_FRAMES: usize = 65536;
@@ -3243,13 +3529,6 @@ pub const TIOCGWINSZ: usize = 0x5413;
 pub const FIONCLEX: usize = 0x5450;
 pub const FIOCLEX: usize = 0x5451;
 pub const FIONBIO: usize = 0x5421;
-
-pub const AT_PHDR: u8 = 3;
-pub const AT_PHENT: u8 = 4;
-pub const AT_PHNUM: u8 = 5;
-pub const AT_PAGESZ: u8 = 6;
-pub const AT_BASE: u8 = 7;
-pub const AT_ENTRY: u8 = 9;
 
 pub const LM_ISIG: u32 = 0o000001;
 pub const LM_ICANON: u32 = 0o000002;
@@ -3338,24 +3617,6 @@ pub const SYS_CLOCK_GETTIME: usize = 228;
 pub const SYS_SIGACTION: usize = 13;
 pub const SYS_SIGPROCMASK: usize = 14;
 pub const SYS_FUTEX: usize = 202;
-
-pub struct CapSet {
-    pub bits: u64,
-    pub effective: u64,
-    pub ambient: u64,
-}
-
-pub struct SigAction {
-    pub handler: usize,
-    pub flags: u32,
-    pub mask: u64,
-}
-
-pub struct SigSet {
-    pub pending: u64,
-    pub blocked: u64,
-    pub actions: Vec<SigAction>,
-}
 
 pub struct TimerEntry {
     pub deadline: usize,
@@ -3856,243 +4117,6 @@ impl KObjRegistry {
             .filter(|(_, e)| e.owner_pid == pid)
             .map(|(id, _)| *id)
             .collect()
-    }
-}
-
-pub struct ProcInit {
-    pub args: Vec<String>,
-    pub envs: Vec<String>,
-    pub auxv: BTreeMap<u8, usize>,
-}
-impl ProcInit {
-    pub fn push_at(&self, top: usize) -> usize {
-        let word = std::mem::size_of::<usize>();
-        let mut sp = top;
-        let mut str_offsets: Vec<usize> = Vec::new();
-        let a0l = self.args.get(0).map_or(0, |s| s.as_bytes().len());
-        sp -= a0l + 1;
-        str_offsets.push(sp);
-        let mut env_locs = Vec::with_capacity(self.envs.len());
-        for e in self.envs.iter() {
-            let el = e.as_bytes().len();
-            sp = sp.wrapping_sub(el + 1);
-            env_locs.push(sp);
-        }
-        let mut arg_locs = Vec::with_capacity(self.args.len());
-        for a in self.args.iter() {
-            let al = a.as_bytes().len();
-            sp = sp.wrapping_sub(al + 1);
-            arg_locs.push(sp);
-        }
-        let aux_pairs = self.auxv.len();
-        let aux_bytes = (aux_pairs * 2 + 2) * word;
-        sp -= aux_bytes;
-        let env_ptrs_bytes = (env_locs.len() + 1) * word;
-        sp -= env_ptrs_bytes;
-        let arg_ptrs_bytes = (arg_locs.len() + 1) * word;
-        sp -= arg_ptrs_bytes;
-        sp -= word;
-        let align = sp & 0xF;
-        if align != 0 {
-            sp -= align;
-        }
-        sp
-    }
-
-    pub fn total_size(&self) -> usize {
-        let mut sz = 0usize;
-        for a in &self.args {
-            sz += a.len() + 1;
-        }
-        for e in &self.envs {
-            sz += e.len() + 1;
-        }
-        sz += (self.auxv.len() * 2 + 2 + self.args.len() + 1 + self.envs.len() + 1 + 1)
-            * std::mem::size_of::<usize>();
-        sz
-    }
-}
-
-impl CapSet {
-    pub fn new() -> Self {
-        Self {
-            bits: 0,
-            effective: 0,
-            ambient: 0,
-        }
-    }
-
-    pub fn full() -> Self {
-        Self {
-            bits: !0u64,
-            effective: !0u64,
-            ambient: 0,
-        }
-    }
-
-    pub fn check(&self, cap: u32) -> bool {
-        if cap >= 64 {
-            return false;
-        }
-        (self.effective & (1u64 << cap)) != 0
-    }
-
-    pub fn grant(&mut self, cap: u32) {
-        if cap < 64 {
-            self.bits |= 1u64 << cap;
-            self.effective |= 1u64 << cap;
-        }
-    }
-
-    pub fn drop_cap(&mut self, cap: u32) {
-        if cap < 64 {
-            self.bits &= !(1u64 << cap);
-            self.effective &= !(1u64 << cap);
-        }
-    }
-
-    pub fn inherit(parent: &CapSet) -> CapSet {
-        let mask = INHERITABLE_MASK;
-        let pb = parent.bits;
-        let pe = parent.effective;
-        let filtered_b = pb & !mask;
-        let filtered_e = pe & !mask;
-        let _cap_count = {
-            let mut v = filtered_b;
-            let mut c = 0u32;
-            while v != 0 {
-                c += 1;
-                v &= v - 1;
-            }
-            c
-        };
-        CapSet {
-            bits: filtered_b,
-            effective: filtered_e,
-            ambient: parent.ambient,
-        }
-    }
-
-    pub fn has_any(&self, mask: u64) -> bool {
-        (self.effective & mask) != 0
-    }
-
-    pub fn clear_ambient(&mut self) {
-        self.ambient = 0;
-    }
-
-    pub fn raise_ambient(&mut self, cap: u32) -> bool {
-        if cap >= 64 {
-            return false;
-        }
-        let bit = 1u64 << cap;
-        if (self.bits & bit) != 0 {
-            self.ambient |= bit;
-            true
-        } else {
-            false
-        }
-    }
-}
-
-impl SigSet {
-    pub fn new() -> Self {
-        let mut actions = Vec::with_capacity(NSIG as usize + 1);
-        for _ in 0..=NSIG {
-            actions.push(SigAction {
-                handler: SIG_DFL,
-                flags: 0,
-                mask: 0,
-            });
-        }
-        Self {
-            pending: 0,
-            blocked: 0,
-            actions,
-        }
-    }
-
-    pub fn sig_pending(&self, signo: u32) -> bool {
-        (self.pending & (1u64 << signo)) != 0
-    }
-
-    pub fn sig_raise(&mut self, signo: u32) {
-        if signo < NSIG {
-            self.pending |= 1u64 << signo;
-        }
-    }
-
-    pub fn coalesce_pending(&mut self) -> u64 {
-        let active = self.pending & !self.blocked;
-        let mut result: u32 = 0;
-        for i in 1..NSIG {
-            if (active & (1u64 << i)) != 0 {
-                result |= 1 << i;
-            }
-        }
-        result as u64
-    }
-
-    pub fn sig_clear(&mut self, signo: u32) {
-        if signo < NSIG {
-            self.pending &= !(1u64 << signo);
-        }
-    }
-
-    pub fn sig_block(&mut self, mask: u64) {
-        self.blocked |= mask;
-        self.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
-    }
-
-    pub fn sig_unblock(&mut self, mask: u64) {
-        self.blocked &= !mask;
-    }
-
-    pub fn sig_setmask(&mut self, mask: u64) {
-        self.blocked = mask & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
-    }
-
-    pub fn deliverable(&self) -> Option<u32> {
-        let actionable = self.pending & !self.blocked;
-        if actionable == 0 {
-            return None;
-        }
-        for i in 1..NSIG {
-            if (actionable & (1u64 << i)) != 0 {
-                return Some(i);
-            }
-        }
-        None
-    }
-
-    pub fn set_action(&mut self, signo: u32, action: SigAction) {
-        if signo < NSIG as u32 && signo != SIGKILL && signo != SIGSTOP {
-            self.actions[signo as usize] = action;
-        }
-    }
-
-    pub fn get_action(&self, signo: u32) -> &SigAction {
-        if (signo as usize) < self.actions.len() {
-            &self.actions[signo as usize]
-        } else {
-            &self.actions[0]
-        }
-    }
-
-    pub fn is_ignored(&self, signo: u32) -> bool {
-        if (signo as usize) < self.actions.len() {
-            self.actions[signo as usize].handler == SIG_IGN
-        } else {
-            false
-        }
-    }
-
-    pub fn clear_non_caught(&mut self) {
-        for i in 1..self.actions.len() {
-            if self.actions[i].handler != SIG_DFL && self.actions[i].handler != SIG_IGN {
-                self.actions[i].handler = SIG_DFL;
-            }
-        }
     }
 }
 
