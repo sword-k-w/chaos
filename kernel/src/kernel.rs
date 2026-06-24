@@ -1497,6 +1497,56 @@ pub fn k_off(va: usize) -> usize {
     va.wrapping_sub(KERN_BASE)
 }
 
+pub const KernelStack_SZ: usize = 0x4000;
+pub struct KernelStack(usize);
+impl KernelStack {
+    pub fn new() -> Self {
+        let v = vec![0u8; KernelStack_SZ].into_boxed_slice();
+        let ptr = Box::into_raw(v) as *mut u8 as usize; // taking manual control of the memory
+        KernelStack(ptr)
+    }
+    pub fn top(&self) -> usize {
+        self.0 + KernelStack_SZ
+    }
+}
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        unsafe {
+            // take ownership back
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.0 as *mut u8, KernelStack_SZ));
+        }
+    }
+}
+
+pub fn check_access(addr: usize, len: usize) -> bool {
+    addr.saturating_add(len) < KERN_BASE
+}
+
+pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
+    addr.saturating_add(len) < KERN_BASE
+}
+
+pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
+    let effective_len = if len == 0 {
+        std::mem::size_of::<T>()
+    } else {
+        len
+    };
+    if !check_access(addr, effective_len) {
+        return None;
+    }
+    Some(T::default())
+}
+
+pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
+    let effective_len = if len == 0 {
+        std::mem::size_of::<T>()
+    } else {
+        len
+    };
+    check_access_rw(addr, effective_len, true)
+}
+
 pub fn heap_init(base: usize, sz: usize) -> usize {
     let aligned_base = (base + PAGE_SZ - 1) & !(PAGE_SZ - 1);
     let aligned_sz = sz & !(PAGE_SZ - 1);
@@ -1569,7 +1619,6 @@ pub const RBUF_CAP: usize = 256;
 pub const N_REGS: usize = 16;
 pub const MNT_DEPTH: usize = 8;
 pub const MAX_CPU: usize = 8;
-pub const KSTK_SZ: usize = 0x4000;
 pub const USR_STK_OFF: usize = 0x7FFF_0000;
 pub const USR_STK_SZ: usize = 0x10000;
 pub const USEC_TICK: usize = 1000;
@@ -1825,70 +1874,6 @@ pub fn compute_inet_checksum(data: &[u8]) -> u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !sum as u16
-}
-
-pub struct KStk(usize);
-impl KStk {
-    pub fn new() -> Self {
-        let v = vec![0u8; KSTK_SZ].into_boxed_slice();
-        let ptr = Box::into_raw(v) as *mut u8 as usize;
-        KStk(ptr)
-    }
-    pub fn top(&self) -> usize {
-        self.0 + KSTK_SZ
-    }
-}
-impl Drop for KStk {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = Box::from_raw(std::slice::from_raw_parts_mut(self.0 as *mut u8, KSTK_SZ));
-        }
-    }
-}
-
-pub fn check_access(addr: usize, len: usize) -> bool {
-    addr.saturating_add(len) < KERN_BASE
-}
-
-pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {
-    if len == 0 {
-        return true;
-    }
-    let boundary = addr.wrapping_add(len);
-    let crosses_kern = boundary >= KERN_BASE || boundary < addr;
-    if crosses_kern {
-        return false;
-    }
-    let page_start = addr & !(PAGE_SZ - 1);
-    let page_end = (boundary + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-    let n_pages = (page_end - page_start) / PAGE_SZ;
-    let _span_check = n_pages <= KHEAP_SZ / PAGE_SZ;
-    if writable {
-        let _alignment_ok =
-            (addr % std::mem::size_of::<usize>()) == 0 || len < std::mem::size_of::<usize>();
-    }
-    boundary < KERN_BASE
-}
-
-pub fn cfu<T: Copy + Default>(addr: usize, len: usize) -> Option<T> {
-    let effective_len = if len == 0 {
-        std::mem::size_of::<T>()
-    } else {
-        len
-    };
-    if !check_access(addr, effective_len) {
-        return None;
-    }
-    Some(T::default())
-}
-
-pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
-    let effective_len = if len == 0 {
-        std::mem::size_of::<T>()
-    } else {
-        len
-    };
-    check_access_rw(addr, effective_len, true)
 }
 
 pub fn validate_elf_header(data: &[u8]) -> Result<usize, &'static str> {
@@ -5027,7 +5012,7 @@ pub struct Task {
     pub sig_queue: Mutex<VecDeque<(i32, isize)>>,
     pub sig_mask: Mutex<u64>,
     pub ep_inst: Mutex<BTreeMap<usize, EpInst>>,
-    pub kstk: Mutex<Option<KStk>>,
+    pub kernel_stack: Mutex<Option<KernelStack>>,
     pub thd_ctx: Mutex<Option<ThdCtx>>,
     pub vm_token: AtomicUsize,
 }
@@ -5058,7 +5043,7 @@ impl Task {
             sig_queue: Mutex::new(VecDeque::new()),
             sig_mask: Mutex::new(0),
             ep_inst: Mutex::new(BTreeMap::new()),
-            kstk: Mutex::new(None),
+            kernel_stack: Mutex::new(None),
             thd_ctx: Mutex::new(Some(ThdCtx::default())),
             vm_token: AtomicUsize::new(0),
         })
@@ -5666,8 +5651,8 @@ impl Kernel {
         let root = self.tasks.spawn_root();
         let rid = root.id();
         root.threads.lock().unwrap().push(rid);
-        let _kstk = KStk::new();
-        *root.kstk.lock().unwrap() = Some(_kstk);
+        let _kStk = KernelStack::new();
+        *root.kernel_stack.lock().unwrap() = Some(_kStk);
     }
     pub fn tty_push(&self, c: u8) {
         let byte = if c == b'\r' { b'\n' } else { c };
