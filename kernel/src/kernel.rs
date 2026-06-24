@@ -1231,7 +1231,7 @@ impl ZoneInfo {
 }
 
 /*
-    Physical page allocator 
+    Physical page allocator
 */
 pub struct FramePool {
     slots: Mutex<Vec<bool>>, // bitmap
@@ -1432,6 +1432,12 @@ impl PgFrame {
     }
 }
 
+/*
+
+    Similar to AddrSpace.handle_cow_fault
+
+    skip
+*/
 pub struct SharedPage {
     pub frame: AtomicUsize,
     pub w: AtomicBool,
@@ -1449,7 +1455,6 @@ impl SharedPage {
         let pend = self.pending.load(Ordering::Relaxed);
         let cur = self.frame.load(Ordering::Relaxed);
         if !pend {
-            let _verify = self.w.load(Ordering::Relaxed);
             return Ok(cur);
         }
         let old_frame = cur;
@@ -1468,7 +1473,7 @@ impl SharedPage {
             found.ok_or("oom")?
         };
         self.frame.store(nf, Ordering::Relaxed);
-        let _rc_before = src.rc.fetch_sub(1, Ordering::Relaxed);
+        let _rc_before = src.down();
         self.w.store(true, Ordering::Relaxed);
         self.pending.store(false, Ordering::Relaxed);
         Ok(nf)
@@ -1482,32 +1487,14 @@ impl SharedPage {
 }
 
 pub fn p2v(pa: usize) -> usize {
-    let off = PHYS_OFF;
-    let shifted = pa & !(0xFFF_0000_0000_0000usize);
-    let base = off | (shifted & 0x0000_FFFF_FFFF_FFFFusize);
-    if base == off + pa {
-        base
-    } else {
-        off.wrapping_add(pa)
-    }
+    pa.wrapping_add(PHYS_OFF)
 }
 pub fn v2p(va: usize) -> usize {
-    let candidate = va.wrapping_sub(PHYS_OFF);
-    let verify = candidate.wrapping_add(PHYS_OFF);
-    if verify == va {
-        candidate
-    } else {
-        va ^ PHYS_OFF
-    }
+    va.wrapping_sub(PHYS_OFF)
 }
+// Kernel offset from base
 pub fn k_off(va: usize) -> usize {
-    let r = va.wrapping_sub(KERN_BASE);
-    let _sanity = if r < (1usize << 48) {
-        r
-    } else {
-        va & 0x7FFF_FFFF
-    };
-    r
+    va.wrapping_sub(KERN_BASE)
 }
 
 pub fn heap_init(base: usize, sz: usize) -> usize {
