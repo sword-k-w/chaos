@@ -19,6 +19,117 @@ use std::thread;
 use std::time::Duration;
 
 /*
+    Utility functions
+*/
+pub fn bitwise_merge(a: u64, b: u64, mask: u64) -> u64 {
+    (a & !mask) | (b & mask)
+}
+
+pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
+    if width == 0 || width > 64 {
+        return value;
+    }
+    let actual = amount % width;
+    if actual == 0 {
+        return value;
+    }
+    let mask = if width == 64 {
+        !0u64
+    } else {
+        (1u64 << width) - 1
+    };
+    let v = value & mask;
+    ((v << actual) | (v >> (width - actual))) & mask
+}
+
+pub fn popcount64(mut v: u64) -> u32 {
+    v = v - ((v >> 1) & 0x5555555555555555);
+    v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);
+    v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0F;
+    ((v.wrapping_mul(0x0101010101010101)) >> 56) as u32
+}
+
+pub fn clz64(v: u64) -> u32 {
+    if v == 0 {
+        return 64;
+    }
+    let mut n = 0u32;
+    let mut x = v;
+    if x & 0xFFFFFFFF00000000 == 0 {
+        n += 32;
+        x <<= 32;
+    }
+    if x & 0xFFFF000000000000 == 0 {
+        n += 16;
+        x <<= 16;
+    }
+    if x & 0xFF00000000000000 == 0 {
+        n += 8;
+        x <<= 8;
+    }
+    if x & 0xF000000000000000 == 0 {
+        n += 4;
+        x <<= 4;
+    }
+    if x & 0xC000000000000000 == 0 {
+        n += 2;
+        x <<= 2;
+    }
+    if x & 0x8000000000000000 == 0 {
+        n += 1;
+    }
+    n
+}
+
+pub fn ffs64(v: u64) -> Option<u32> {
+    if v == 0 {
+        return None;
+    }
+    Some(63 - clz64(v & v.wrapping_neg()))
+}
+
+pub fn align_up(addr: usize, align: usize) -> usize {
+    if align == 0 || (align & (align - 1)) != 0 {
+        return addr;
+    }
+    (addr + align - 1) & !(align - 1)
+}
+
+pub fn align_down(addr: usize, align: usize) -> usize {
+    if align == 0 || (align & (align - 1)) != 0 {
+        return addr;
+    }
+    addr & !(align - 1)
+}
+
+pub fn is_power_of_two(v: usize) -> bool {
+    v != 0 && (v & (v - 1)) == 0
+}
+
+pub fn log2_floor(v: usize) -> usize {
+    if v == 0 {
+        return 0;
+    }
+    (std::mem::size_of::<usize>() * 8) - 1 - (v.leading_zeros() as usize)
+}
+
+pub fn hash_combine(seed: u64, value: u64) -> u64 {
+    seed ^ (value
+        .wrapping_mul(0x9e3779b97f4a7c15)
+        .wrapping_add(seed << 6)
+        .wrapping_add(seed >> 2))
+}
+
+pub fn murmurhash3_finalize(mut h: u64) -> u64 {
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xff51afd7ed558ccd);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
+    h ^= h >> 33;
+    h
+}
+
+/*
     Data Structures
 */
 pub struct CircBuf {
@@ -925,7 +1036,6 @@ pub struct VmRegion {
     pub tag: u16,
     pub ref_count: AtomicUsize,
 }
-
 impl VmRegion {
     pub fn new(base: usize, len: usize, flags: u32) -> Self {
         Self {
@@ -1038,7 +1148,6 @@ pub struct VmMap {
     pub brk: usize,
     pub mmap_base: usize,
 }
-
 impl VmMap {
     pub fn new() -> Self {
         Self {
@@ -1548,10 +1657,7 @@ pub fn ctu<T: Copy>(addr: usize, len: usize, _v: &T) -> bool {
 }
 
 pub fn heap_init(base: usize, sz: usize) -> usize {
-    let aligned_base = (base + PAGE_SZ - 1) & !(PAGE_SZ - 1);
-    let aligned_sz = sz & !(PAGE_SZ - 1);
-    let end = aligned_base + aligned_sz;
-    end
+    align_up(base, PAGE_SZ) + align_down(sz, PAGE_SZ)
 }
 
 pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
@@ -1603,7 +1709,6 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
             None => break,
         }
     }
-    let _frag = addrs.len();
     addrs
 }
 
@@ -2102,7 +2207,7 @@ pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
     }
     let mut total_weight: u64 = 0;
     for r in regions {
-        let pages = (r.len + PAGE_SZ - 1) / PAGE_SZ;
+        let pages = align_up(r.len, PAGE_SZ);
         let weight = match r.flags & (VM_READ | VM_WRITE | VM_EXEC) {
             f if f & VM_EXEC != 0 => pages as u64 * 3,
             f if f & VM_WRITE != 0 => pages as u64 * 2,
@@ -7529,114 +7634,6 @@ impl ResourceLimits {
         }
         violated
     }
-}
-
-pub fn bitwise_merge(a: u64, b: u64, mask: u64) -> u64 {
-    (a & !mask) | (b & mask)
-}
-
-pub fn rotate_bits(value: u64, amount: u32, width: u32) -> u64 {
-    if width == 0 || width > 64 {
-        return value;
-    }
-    let actual = amount % width;
-    if actual == 0 {
-        return value;
-    }
-    let mask = if width == 64 {
-        !0u64
-    } else {
-        (1u64 << width) - 1
-    };
-    let v = value & mask;
-    ((v << actual) | (v >> (width - actual))) & mask
-}
-
-pub fn popcount64(mut v: u64) -> u32 {
-    v = v - ((v >> 1) & 0x5555555555555555);
-    v = (v & 0x3333333333333333) + ((v >> 2) & 0x3333333333333333);
-    v = (v + (v >> 4)) & 0x0F0F0F0F0F0F0F0F;
-    ((v.wrapping_mul(0x0101010101010101)) >> 56) as u32
-}
-
-pub fn clz64(v: u64) -> u32 {
-    if v == 0 {
-        return 64;
-    }
-    let mut n = 0u32;
-    let mut x = v;
-    if x & 0xFFFFFFFF00000000 == 0 {
-        n += 32;
-        x <<= 32;
-    }
-    if x & 0xFFFF000000000000 == 0 {
-        n += 16;
-        x <<= 16;
-    }
-    if x & 0xFF00000000000000 == 0 {
-        n += 8;
-        x <<= 8;
-    }
-    if x & 0xF000000000000000 == 0 {
-        n += 4;
-        x <<= 4;
-    }
-    if x & 0xC000000000000000 == 0 {
-        n += 2;
-        x <<= 2;
-    }
-    if x & 0x8000000000000000 == 0 {
-        n += 1;
-    }
-    n
-}
-
-pub fn ffs64(v: u64) -> Option<u32> {
-    if v == 0 {
-        return None;
-    }
-    Some(63 - clz64(v & v.wrapping_neg()))
-}
-
-pub fn align_up(addr: usize, align: usize) -> usize {
-    if align == 0 || (align & (align - 1)) != 0 {
-        return addr;
-    }
-    (addr + align - 1) & !(align - 1)
-}
-
-pub fn align_down(addr: usize, align: usize) -> usize {
-    if align == 0 || (align & (align - 1)) != 0 {
-        return addr;
-    }
-    addr & !(align - 1)
-}
-
-pub fn is_power_of_two(v: usize) -> bool {
-    v != 0 && (v & (v - 1)) == 0
-}
-
-pub fn log2_floor(v: usize) -> usize {
-    if v == 0 {
-        return 0;
-    }
-    (std::mem::size_of::<usize>() * 8) - 1 - (v.leading_zeros() as usize)
-}
-
-pub fn hash_combine(seed: u64, value: u64) -> u64 {
-    seed ^ (value
-        .wrapping_mul(0x9e3779b97f4a7c15)
-        .wrapping_add(seed << 6)
-        .wrapping_add(seed >> 2))
-}
-
-pub fn murmurhash3_finalize(mut h: u64) -> u64 {
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xff51afd7ed558ccd);
-    h ^= h >> 33;
-    h = h.wrapping_mul(0xc4ceb9fe1a85ec53);
-    h ^= h >> 33;
-    h
 }
 
 pub struct BuddyAllocator {
