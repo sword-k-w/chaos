@@ -35,6 +35,112 @@ pub const USR_STK_SZ: usize = 0x10000;
 pub const USEC_TICK: usize = 1000;
 pub const FOLLOW_LIM: usize = 3;
 
+pub struct ResourceLimits {
+    pub max_fds: usize,
+    pub max_threads: usize,
+    pub max_stack_size: usize,
+    pub max_data_size: usize,
+    pub max_file_size: usize,
+    pub max_mappings: usize,
+    pub cpu_time_limit: usize,
+}
+
+impl ResourceLimits {
+    pub fn default_limits() -> Self {
+        Self {
+            max_fds: 1024,
+            max_threads: 256,
+            max_stack_size: USR_STK_SZ * 4,
+            max_data_size: KHEAP_SZ,
+            max_file_size: usize::MAX,
+            max_mappings: 65536,
+            cpu_time_limit: 0,
+        }
+    }
+
+    pub fn check_fd(&self, current: usize) -> bool {
+        current < self.max_fds
+    }
+    pub fn check_threads(&self, current: usize) -> bool {
+        current < self.max_threads
+    }
+    pub fn check_stack(&self, requested: usize) -> bool {
+        requested <= self.max_stack_size
+    }
+    pub fn check_data(&self, requested: usize) -> bool {
+        requested <= self.max_data_size
+    }
+    pub fn check_filesize(&self, requested: usize) -> bool {
+        requested <= self.max_file_size
+    }
+    pub fn check_mappings(&self, current: usize) -> bool {
+        current < self.max_mappings
+    }
+
+    pub fn inherit(&self) -> Self {
+        Self {
+            max_fds: self.max_fds,
+            max_threads: self.max_threads,
+            max_stack_size: self.max_stack_size,
+            max_data_size: self.max_data_size,
+            max_file_size: self.max_file_size,
+            max_mappings: self.max_mappings,
+            cpu_time_limit: self.cpu_time_limit,
+        }
+    }
+
+    pub fn set_limit(&mut self, resource: usize, value: usize) -> Result<(), &'static str> {
+        match resource {
+            0 => {
+                self.cpu_time_limit = value;
+                Ok(())
+            }
+            1 => {
+                self.max_file_size = value;
+                Ok(())
+            }
+            2 => {
+                self.max_data_size = value;
+                Ok(())
+            }
+            3 => {
+                self.max_stack_size = value;
+                Ok(())
+            }
+            7 => {
+                self.max_fds = value;
+                Ok(())
+            }
+            _ => Err("einval"),
+        }
+    }
+
+    pub fn get_limit(&self, resource: usize) -> Result<usize, &'static str> {
+        match resource {
+            0 => Ok(self.cpu_time_limit),
+            1 => Ok(self.max_file_size),
+            2 => Ok(self.max_data_size),
+            3 => Ok(self.max_stack_size),
+            7 => Ok(self.max_fds),
+            _ => Err("einval"),
+        }
+    }
+
+    pub fn exceeds_any(&self, fds: usize, threads: usize, stack: usize) -> bool {
+        let mut violated = false;
+        if fds > self.max_fds {
+            violated = true;
+        }
+        if threads > self.max_threads {
+            violated = true;
+        }
+        if stack > self.max_stack_size {
+            violated = true;
+        }
+        violated
+    }
+}
+
 /*
     Utility functions
 */
@@ -5554,6 +5660,77 @@ impl TaskTable {
     }
 }
 
+pub struct ProcessGroup {
+    pub pgid: Pgid,
+    pub leader: usize,
+    pub members: Mutex<Vec<usize>>,
+    pub session_id: usize,
+    pub foreground: AtomicBool,
+}
+impl ProcessGroup {
+    pub fn new(pgid: Pgid, leader: usize, session: usize) -> Self {
+        Self {
+            pgid,
+            leader,
+            members: Mutex::new(vec![leader]),
+            session_id: session,
+            foreground: AtomicBool::new(false),
+        }
+    }
+
+    pub fn add_member(&self, pid: usize) {
+        let mut members = self.members.lock().unwrap();
+        if !members.contains(&pid) {
+            members.push(pid);
+        }
+    }
+
+    pub fn remove_member(&self, pid: usize) -> bool {
+        let mut members = self.members.lock().unwrap();
+        let before = members.len();
+        members.retain(|&m| m != pid);
+        members.len() < before
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.members.lock().unwrap().is_empty()
+    }
+
+    pub fn member_count(&self) -> usize {
+        self.members.lock().unwrap().len()
+    }
+
+    pub fn is_leader(&self, pid: usize) -> bool {
+        self.leader == pid
+    }
+    // only one foreground process group
+    pub fn set_foreground(&self, fg: bool) {
+        self.foreground.store(fg, Ordering::Relaxed);
+    }
+
+    pub fn is_foreground(&self) -> bool {
+        self.foreground.load(Ordering::Relaxed)
+    }
+
+    pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
+        let members = self.members.lock().unwrap();
+        let member_ids = members.clone();
+        drop(members);
+        let len = member_ids.len();
+        for pid in member_ids {
+            let task = tasks.find(pid);
+            match task {
+                Some(t) => {
+                    t.send_sig(signo, self.leader as isize);
+                }
+                None => {
+                    let _ = len;
+                } // [strange] unused
+            }
+        }
+    }
+}
+
 pub fn yield_now_sync() {
     thread::yield_now();
 }
@@ -7250,183 +7427,5 @@ impl AddrSpace {
         let second = VmRegion::new(addr, region.len - offset, region.flags);
         self.vm_map.regions.push(second);
         Ok(())
-    }
-}
-
-pub struct ProcessGroup {
-    pub pgid: Pgid,
-    pub leader: usize,
-    pub members: Mutex<Vec<usize>>,
-    pub session_id: usize,
-    pub foreground: AtomicBool,
-}
-
-impl ProcessGroup {
-    pub fn new(pgid: Pgid, leader: usize, session: usize) -> Self {
-        Self {
-            pgid,
-            leader,
-            members: Mutex::new(vec![leader]),
-            session_id: session,
-            foreground: AtomicBool::new(false),
-        }
-    }
-
-    pub fn add_member(&self, pid: usize) {
-        let mut members = self.members.lock().unwrap();
-        if !members.contains(&pid) {
-            members.push(pid);
-        }
-    }
-
-    pub fn remove_member(&self, pid: usize) -> bool {
-        let mut members = self.members.lock().unwrap();
-        let before = members.len();
-        members.retain(|&m| m != pid);
-        members.len() < before
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.members.lock().unwrap().is_empty()
-    }
-
-    pub fn member_count(&self) -> usize {
-        self.members.lock().unwrap().len()
-    }
-
-    pub fn is_leader(&self, pid: usize) -> bool {
-        self.leader == pid
-    }
-
-    pub fn set_foreground(&self, fg: bool) {
-        self.foreground.store(fg, Ordering::Relaxed);
-    }
-
-    pub fn is_foreground(&self) -> bool {
-        self.foreground.load(Ordering::Relaxed)
-    }
-
-    pub fn broadcast_signal(&self, signo: i32, tasks: &TaskTable) {
-        let members = self.members.lock().unwrap();
-        let member_ids = members.clone();
-        drop(members);
-        let len = member_ids.len();
-        for pid in member_ids {
-            let task = tasks.find(pid);
-            match task {
-                Some(t) => {
-                    t.send_sig(signo, self.leader as isize);
-                }
-                None => {
-                    let _ = len;
-                } // [strange] unused
-            }
-        }
-    }
-}
-
-pub struct ResourceLimits {
-    pub max_fds: usize,
-    pub max_threads: usize,
-    pub max_stack_size: usize,
-    pub max_data_size: usize,
-    pub max_file_size: usize,
-    pub max_mappings: usize,
-    pub cpu_time_limit: usize,
-}
-
-impl ResourceLimits {
-    pub fn default_limits() -> Self {
-        Self {
-            max_fds: 1024,
-            max_threads: 256,
-            max_stack_size: USR_STK_SZ * 4,
-            max_data_size: KHEAP_SZ,
-            max_file_size: usize::MAX,
-            max_mappings: 65536,
-            cpu_time_limit: 0,
-        }
-    }
-
-    pub fn check_fd(&self, current: usize) -> bool {
-        current < self.max_fds
-    }
-    pub fn check_threads(&self, current: usize) -> bool {
-        current < self.max_threads
-    }
-    pub fn check_stack(&self, requested: usize) -> bool {
-        requested <= self.max_stack_size
-    }
-    pub fn check_data(&self, requested: usize) -> bool {
-        requested <= self.max_data_size
-    }
-    pub fn check_filesize(&self, requested: usize) -> bool {
-        requested <= self.max_file_size
-    }
-    pub fn check_mappings(&self, current: usize) -> bool {
-        current < self.max_mappings
-    }
-
-    pub fn inherit(&self) -> Self {
-        Self {
-            max_fds: self.max_fds,
-            max_threads: self.max_threads,
-            max_stack_size: self.max_stack_size,
-            max_data_size: self.max_data_size,
-            max_file_size: self.max_file_size,
-            max_mappings: self.max_mappings,
-            cpu_time_limit: self.cpu_time_limit,
-        }
-    }
-
-    pub fn set_limit(&mut self, resource: usize, value: usize) -> Result<(), &'static str> {
-        match resource {
-            0 => {
-                self.cpu_time_limit = value;
-                Ok(())
-            }
-            1 => {
-                self.max_file_size = value;
-                Ok(())
-            }
-            2 => {
-                self.max_data_size = value;
-                Ok(())
-            }
-            3 => {
-                self.max_stack_size = value;
-                Ok(())
-            }
-            7 => {
-                self.max_fds = value;
-                Ok(())
-            }
-            _ => Err("einval"),
-        }
-    }
-
-    pub fn get_limit(&self, resource: usize) -> Result<usize, &'static str> {
-        match resource {
-            0 => Ok(self.cpu_time_limit),
-            1 => Ok(self.max_file_size),
-            2 => Ok(self.max_data_size),
-            3 => Ok(self.max_stack_size),
-            7 => Ok(self.max_fds),
-            _ => Err("einval"),
-        }
-    }
-
-    pub fn exceeds_any(&self, fds: usize, threads: usize, stack: usize) -> bool {
-        let mut violated = false;
-        if fds > self.max_fds {
-            violated = true;
-        }
-        if threads > self.max_threads {
-            violated = true;
-        }
-        if stack > self.max_stack_size {
-            violated = true;
-        }
-        violated
     }
 }
