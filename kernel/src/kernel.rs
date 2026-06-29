@@ -3303,7 +3303,6 @@ impl ProcInit {
     }
 }
 
-
 pub const CAP_CHOWN: u32 = 0;
 pub const CAP_KILL: u32 = 5;
 pub const CAP_SETGID: u32 = 6;
@@ -3387,25 +3386,34 @@ impl CapabilitySet {
     }
 }
 
-pub struct SigAction {
-    pub handler: usize,
-    pub flags: u32,
-    pub mask: u64,
+/*
+    Signals
+    https://rcore-os.cn/rCore-Tutorial-Book-v3/chapter7/4signal.html
+*/
+pub const NSIG: u32 = 64;
+pub const SIG_DFL: usize = 0;
+pub const SIG_IGN: usize = 1;
+pub const SIGKILL: u32 = 9;
+pub const SIGUSR1: u32 = 10;
+pub const SIGUSR2: u32 = 12;
+pub const SIGALRM: u32 = 14;
+pub const SIGCHLD: u32 = 17;
+pub const SIGSTOP: u32 = 19;
+pub struct SignalAction {
+    pub handler: usize, // address of signal handler
+    pub mask: u64,      // signals to block while this handler runs
 }
-
-pub struct SigSet {
+pub struct SignalSet {
     pub pending: u64,
     pub blocked: u64,
-    pub actions: Vec<SigAction>,
+    pub actions: Vec<SignalAction>,
 }
-
-impl SigSet {
+impl SignalSet {
     pub fn new() -> Self {
         let mut actions = Vec::with_capacity(NSIG as usize + 1);
         for _ in 0..=NSIG {
-            actions.push(SigAction {
+            actions.push(SignalAction {
                 handler: SIG_DFL,
-                flags: 0,
                 mask: 0,
             });
         }
@@ -3416,43 +3424,36 @@ impl SigSet {
         }
     }
 
-    pub fn sig_pending(&self, signo: u32) -> bool {
+    pub fn signal_pending(&self, signo: u32) -> bool {
         (self.pending & (1u64 << signo)) != 0
     }
 
-    pub fn sig_raise(&mut self, signo: u32) {
+    pub fn signal_raise(&mut self, signo: u32) {
         if signo < NSIG {
             self.pending |= 1u64 << signo;
         }
     }
 
     pub fn coalesce_pending(&mut self) -> u64 {
-        let active = self.pending & !self.blocked;
-        let mut result: u32 = 0;
-        for i in 1..NSIG {
-            if (active & (1u64 << i)) != 0 {
-                result |= 1 << i;
-            }
-        }
-        result as u64
+        self.pending & !self.blocked
     }
 
-    pub fn sig_clear(&mut self, signo: u32) {
+    pub fn signal_clear(&mut self, signo: u32) {
         if signo < NSIG {
             self.pending &= !(1u64 << signo);
         }
     }
 
-    pub fn sig_block(&mut self, mask: u64) {
+    pub fn signal_block(&mut self, mask: u64) {
         self.blocked |= mask;
         self.blocked &= !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
     }
 
-    pub fn sig_unblock(&mut self, mask: u64) {
+    pub fn signal_unblock(&mut self, mask: u64) {
         self.blocked &= !mask;
     }
 
-    pub fn sig_setmask(&mut self, mask: u64) {
+    pub fn signal_setmask(&mut self, mask: u64) {
         self.blocked = mask & !((1u64 << SIGKILL) | (1u64 << SIGSTOP));
     }
 
@@ -3469,13 +3470,13 @@ impl SigSet {
         None
     }
 
-    pub fn set_action(&mut self, signo: u32, action: SigAction) {
+    pub fn set_action(&mut self, signo: u32, action: SignalAction) {
         if signo < NSIG as u32 && signo != SIGKILL && signo != SIGSTOP {
             self.actions[signo as usize] = action;
         }
     }
 
-    pub fn get_action(&self, signo: u32) -> &SigAction {
+    pub fn get_action(&self, signo: u32) -> &SignalAction {
         if (signo as usize) < self.actions.len() {
             &self.actions[signo as usize]
         } else {
@@ -3551,16 +3552,6 @@ pub const SCHED_FIFO: u8 = 1;
 pub const SCHED_RR: u8 = 2;
 pub const SCHED_BATCH: u8 = 3;
 
-pub const NSIG: u32 = 64;
-pub const SIG_DFL: usize = 0;
-pub const SIG_IGN: usize = 1;
-pub const SIGKILL: u32 = 9;
-pub const SIGSTOP: u32 = 19;
-pub const SIGCHLD: u32 = 17;
-pub const SIGUSR1: u32 = 10;
-pub const SIGUSR2: u32 = 12;
-pub const SIGALRM: u32 = 14;
-
 pub const TIMER_WHEEL_SIZE: usize = 256;
 pub const TIMER_TICK_HZ: usize = 100;
 pub const BOOT_EPOCH: usize = 1_700_000_000; // [doubtful] the value is uncertain, but probably does not affect the test
@@ -3600,7 +3591,7 @@ pub const SYS_EPOLL_CREATE: usize = 213;
 pub const SYS_EPOLL_CTL: usize = 233;
 pub const SYS_EPOLL_WAIT: usize = 232;
 pub const SYS_CLOCK_GETTIME: usize = 228;
-pub const SYS_SIGACTION: usize = 13;
+pub const SYS_SignalAction: usize = 13;
 pub const SYS_SIGPROCMASK: usize = 14;
 pub const SYS_FUTEX: usize = 202;
 
@@ -6460,7 +6451,7 @@ impl Kernel {
                     _ => Err("einval"),
                 }
             }
-            SYS_SIGACTION => {
+            SYS_SignalAction => {
                 let signo = a0;
                 let act_addr = a1;
                 let oldact_addr = a2;
