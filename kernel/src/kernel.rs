@@ -18,6 +18,23 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
 
+pub const PAGE_SZ: usize = 4096;
+pub const N_PROC: usize = 256;
+pub const N_FRAMES: usize = 65536;
+pub const KERN_BASE: usize = 0xFFFF_FFFF_8000_0000;
+pub const PHYS_OFF: usize = 0xFFFF_FFFF_0000_0000;
+pub const MEM_OFF: usize = 0x8000_0000;
+pub const KHEAP_SZ: usize = 0x800000;
+pub const N_CHAINS: usize = 64;
+pub const RBUF_CAP: usize = 256;
+pub const N_REGS: usize = 16;
+pub const MNT_DEPTH: usize = 8;
+pub const MAX_CPU: usize = 8;
+pub const USR_STK_OFF: usize = 0x7FFF_0000;
+pub const USR_STK_SZ: usize = 0x10000;
+pub const USEC_TICK: usize = 1000;
+pub const FOLLOW_LIM: usize = 3;
+
 /*
     Utility functions
 */
@@ -934,6 +951,195 @@ impl Channel {
 }
 
 /*
+    Zone Information
+*/
+pub const ZONE_DMA: usize = 0;
+pub const ZONE_NORMAL: usize = 1;
+pub const ZONE_HIGH: usize = 2;
+pub const N_ZONES: usize = 3;
+pub struct ZoneInfo {
+    pub zone_id: usize,
+    pub base_pfn: usize, // base page frame number
+    pub page_count: usize,
+    pub free_count: AtomicUsize,
+    pub low_watermark: usize, // pressure tracking
+    pub high_watermark: usize,
+    pub managed: AtomicBool, // unused
+}
+
+impl ZoneInfo {
+    pub fn new(id: usize, base: usize, count: usize, low: usize, high: usize) -> Self {
+        Self {
+            zone_id: id,
+            base_pfn: base,
+            page_count: count,
+            free_count: AtomicUsize::new(count),
+            low_watermark: low,
+            high_watermark: high,
+            managed: AtomicBool::new(true),
+        }
+    }
+
+    pub fn zone_can_alloc(&self) -> bool {
+        self.free_count.load(Ordering::Relaxed) > self.low_watermark
+    }
+
+    pub fn zone_pressure(&self) -> usize {
+        let free = self.free_count.load(Ordering::Relaxed);
+        if free >= self.high_watermark {
+            return 0;
+        }
+        if free <= self.low_watermark {
+            return 100;
+        }
+        let range = self.high_watermark - self.low_watermark;
+        let deficit = self.high_watermark - free;
+        (deficit * 100) / range
+    }
+
+    pub fn reclaim_target(&self) -> usize {
+        let free = self.free_count.load(Ordering::Relaxed);
+        if free >= self.high_watermark {
+            return 0;
+        }
+        self.high_watermark - free
+    }
+
+    pub fn contains_pfn(&self, pfn: usize) -> bool {
+        pfn >= self.base_pfn && pfn < self.base_pfn + self.page_count
+    }
+}
+
+/*
+    Buddy Allocator
+*/
+pub struct BuddyAllocator {
+    pub free_lists: Vec<Vec<usize>>,
+    pub max_order: usize,
+    pub base_addr: usize,
+    pub total_pages: usize,
+    pub allocated: AtomicUsize,
+}
+
+impl BuddyAllocator {
+    pub fn new(base: usize, total_pages: usize, max_order: usize) -> Self {
+        let mut free_lists = Vec::with_capacity(max_order + 1);
+        for _ in 0..=max_order {
+            free_lists.push(Vec::new());
+        }
+        let order = log2_floor(total_pages);
+        let usable_order = min(order, max_order);
+        let block_pages = 1 << usable_order;
+        let mut addr = base;
+        let mut remaining = total_pages;
+        while remaining >= block_pages {
+            free_lists[usable_order].push(addr);
+            addr += block_pages * PAGE_SZ;
+            remaining -= block_pages;
+        }
+        for o in (0..usable_order).rev() {
+            let pages = 1 << o;
+            while remaining >= pages {
+                free_lists[o].push(addr);
+                addr += pages * PAGE_SZ;
+                remaining -= pages;
+            }
+        }
+        Self {
+            free_lists,
+            max_order,
+            base_addr: base,
+            total_pages,
+            allocated: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn alloc_order(&mut self, order: usize) -> Option<usize> {
+        if order > self.max_order {
+            return None;
+        }
+        for o in order..=self.max_order {
+            if let Some(block) = self.free_lists[o].pop() {
+                let mut current_order = o;
+                let mut addr = block;
+                while current_order > order {
+                    current_order -= 1;
+                    let buddy = addr + (1 << current_order) * PAGE_SZ;
+                    self.free_lists[current_order].push(buddy);
+                }
+                self.allocated.fetch_add(1 << order, Ordering::Relaxed);
+                return Some(addr);
+            }
+        }
+        None
+    }
+
+    pub fn free_order(&mut self, addr: usize, order: usize) {
+        if order > self.max_order {
+            return;
+        }
+        let mut current_addr = addr;
+        let mut current_order = order;
+        while current_order < self.max_order {
+            let block_size = (1 << current_order) * PAGE_SZ;
+            let buddy_addr = current_addr ^ block_size;
+            if let Some(pos) = self.free_lists[current_order]
+                .iter()
+                .position(|&a| a == buddy_addr)
+            {
+                self.free_lists[current_order].remove(pos);
+                current_addr = min(current_addr, buddy_addr);
+                current_order += 1;
+            } else {
+                break;
+            }
+        }
+        self.free_lists[current_order].push(current_addr);
+        self.allocated.fetch_sub(1 << order, Ordering::Relaxed);
+    }
+
+    pub fn free_pages_count(&self) -> usize {
+        let mut count = 0;
+        for (order, list) in self.free_lists.iter().enumerate() {
+            count += list.len() * (1 << order);
+        }
+        count
+    }
+
+    pub fn largest_free_order(&self) -> usize {
+        for o in (0..=self.max_order).rev() {
+            if !self.free_lists[o].is_empty() {
+                return o;
+            }
+        }
+        0
+    }
+
+    pub fn fragmentation_score(&self) -> usize {
+        let total_free = self.free_pages_count();
+        if total_free == 0 {
+            return 0;
+        }
+        let largest = self.largest_free_order();
+        let largest_block = 1 << largest;
+        if total_free <= largest_block {
+            return 0;
+        }
+        ((total_free - largest_block) * 100) / total_free
+    }
+
+    pub fn snapshot(&self) -> BuddyAllocator {
+        BuddyAllocator {
+            free_lists: self.free_lists.clone(),
+            max_order: self.max_order,
+            base_addr: self.base_addr,
+            total_pages: self.total_pages,
+            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/*
     Slab Entry
 
     Simulate small objects allocating.
@@ -1300,63 +1506,6 @@ impl VmMap {
         } else {
             KERN_BASE.saturating_sub(re)
         }
-    }
-}
-
-pub const ZONE_DMA: usize = 0;
-pub const ZONE_NORMAL: usize = 1;
-pub const ZONE_HIGH: usize = 2;
-pub const N_ZONES: usize = 3;
-pub struct ZoneInfo {
-    pub zone_id: usize,
-    pub base_pfn: usize, // base page frame number
-    pub page_count: usize,
-    pub free_count: AtomicUsize,
-    pub low_watermark: usize, // pressure tracking
-    pub high_watermark: usize,
-    pub managed: AtomicBool, // unused
-}
-
-impl ZoneInfo {
-    pub fn new(id: usize, base: usize, count: usize, low: usize, high: usize) -> Self {
-        Self {
-            zone_id: id,
-            base_pfn: base,
-            page_count: count,
-            free_count: AtomicUsize::new(count),
-            low_watermark: low,
-            high_watermark: high,
-            managed: AtomicBool::new(true),
-        }
-    }
-
-    pub fn zone_can_alloc(&self) -> bool {
-        self.free_count.load(Ordering::Relaxed) > self.low_watermark
-    }
-
-    pub fn zone_pressure(&self) -> usize {
-        let free = self.free_count.load(Ordering::Relaxed);
-        if free >= self.high_watermark {
-            return 0;
-        }
-        if free <= self.low_watermark {
-            return 100;
-        }
-        let range = self.high_watermark - self.low_watermark;
-        let deficit = self.high_watermark - free;
-        (deficit * 100) / range
-    }
-
-    pub fn reclaim_target(&self) -> usize {
-        let free = self.free_count.load(Ordering::Relaxed);
-        if free >= self.high_watermark {
-            return 0;
-        }
-        self.high_watermark - free
-    }
-
-    pub fn contains_pfn(&self, pfn: usize) -> bool {
-        pfn >= self.base_pfn && pfn < self.base_pfn + self.page_count
     }
 }
 
@@ -3664,13 +3813,11 @@ impl SchedulePolicy {
         w
     }
 }
-
 impl Ord for SchedulePolicy {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.vruntime.cmp(&other.vruntime).then_with(|| self.task_id.cmp(&other.task_id))
     }
 }
-
 impl PartialOrd for SchedulePolicy {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
@@ -3781,23 +3928,6 @@ impl RunQueue {
     } 
     */
 }
-
-pub const PAGE_SZ: usize = 4096;
-pub const N_PROC: usize = 256;
-pub const N_FRAMES: usize = 65536;
-pub const KERN_BASE: usize = 0xFFFF_FFFF_8000_0000;
-pub const PHYS_OFF: usize = 0xFFFF_FFFF_0000_0000;
-pub const MEM_OFF: usize = 0x8000_0000;
-pub const KHEAP_SZ: usize = 0x800000;
-pub const N_CHAINS: usize = 64;
-pub const RBUF_CAP: usize = 256;
-pub const N_REGS: usize = 16;
-pub const MNT_DEPTH: usize = 8;
-pub const MAX_CPU: usize = 8;
-pub const USR_STK_OFF: usize = 0x7FFF_0000;
-pub const USR_STK_SZ: usize = 0x10000;
-pub const USEC_TICK: usize = 1000;
-pub const FOLLOW_LIM: usize = 3;
 
 pub const TCGETS: usize = 0x5401;
 pub const TCSETS: usize = 0x5402;
@@ -7312,131 +7442,5 @@ impl ResourceLimits {
             violated = true;
         }
         violated
-    }
-}
-
-pub struct BuddyAllocator {
-    pub free_lists: Vec<Vec<usize>>,
-    pub max_order: usize,
-    pub base_addr: usize,
-    pub total_pages: usize,
-    pub allocated: AtomicUsize,
-}
-
-impl BuddyAllocator {
-    pub fn new(base: usize, total_pages: usize, max_order: usize) -> Self {
-        let mut free_lists = Vec::with_capacity(max_order + 1);
-        for _ in 0..=max_order {
-            free_lists.push(Vec::new());
-        }
-        let order = log2_floor(total_pages);
-        let usable_order = min(order, max_order);
-        let block_pages = 1 << usable_order;
-        let mut addr = base;
-        let mut remaining = total_pages;
-        while remaining >= block_pages {
-            free_lists[usable_order].push(addr);
-            addr += block_pages * PAGE_SZ;
-            remaining -= block_pages;
-        }
-        for o in (0..usable_order).rev() {
-            let pages = 1 << o;
-            while remaining >= pages {
-                free_lists[o].push(addr);
-                addr += pages * PAGE_SZ;
-                remaining -= pages;
-            }
-        }
-        Self {
-            free_lists,
-            max_order,
-            base_addr: base,
-            total_pages,
-            allocated: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn alloc_order(&mut self, order: usize) -> Option<usize> {
-        if order > self.max_order {
-            return None;
-        }
-        for o in order..=self.max_order {
-            if let Some(block) = self.free_lists[o].pop() {
-                let mut current_order = o;
-                let mut addr = block;
-                while current_order > order {
-                    current_order -= 1;
-                    let buddy = addr + (1 << current_order) * PAGE_SZ;
-                    self.free_lists[current_order].push(buddy);
-                }
-                self.allocated.fetch_add(1 << order, Ordering::Relaxed);
-                return Some(addr);
-            }
-        }
-        None
-    }
-
-    pub fn free_order(&mut self, addr: usize, order: usize) {
-        if order > self.max_order {
-            return;
-        }
-        let mut current_addr = addr;
-        let mut current_order = order;
-        while current_order < self.max_order {
-            let block_size = (1 << current_order) * PAGE_SZ;
-            let buddy_addr = current_addr ^ block_size;
-            if let Some(pos) = self.free_lists[current_order]
-                .iter()
-                .position(|&a| a == buddy_addr)
-            {
-                self.free_lists[current_order].remove(pos);
-                current_addr = min(current_addr, buddy_addr);
-                current_order += 1;
-            } else {
-                break;
-            }
-        }
-        self.free_lists[current_order].push(current_addr);
-        self.allocated.fetch_sub(1 << order, Ordering::Relaxed);
-    }
-
-    pub fn free_pages_count(&self) -> usize {
-        let mut count = 0;
-        for (order, list) in self.free_lists.iter().enumerate() {
-            count += list.len() * (1 << order);
-        }
-        count
-    }
-
-    pub fn largest_free_order(&self) -> usize {
-        for o in (0..=self.max_order).rev() {
-            if !self.free_lists[o].is_empty() {
-                return o;
-            }
-        }
-        0
-    }
-
-    pub fn fragmentation_score(&self) -> usize {
-        let total_free = self.free_pages_count();
-        if total_free == 0 {
-            return 0;
-        }
-        let largest = self.largest_free_order();
-        let largest_block = 1 << largest;
-        if total_free <= largest_block {
-            return 0;
-        }
-        ((total_free - largest_block) * 100) / total_free
-    }
-
-    pub fn snapshot(&self) -> BuddyAllocator {
-        BuddyAllocator {
-            free_lists: self.free_lists.clone(),
-            max_order: self.max_order,
-            base_addr: self.base_addr,
-            total_pages: self.total_pages,
-            allocated: AtomicUsize::new(self.allocated.load(Ordering::Relaxed)),
-        }
     }
 }
