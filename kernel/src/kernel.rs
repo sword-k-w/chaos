@@ -1431,270 +1431,6 @@ impl SlabEntry {
     }
 }
 
-/*
-    Virtual Memory
-*/
-pub const VM_READ: u32 = 0x01;
-pub const VM_WRITE: u32 = 0x02;
-pub const VM_EXEC: u32 = 0x04;
-pub const VM_SHARED: u32 = 0x08;
-pub const VM_GROWSDOWN: u32 = 0x10;
-pub const VM_DONTCOPY: u32 = 0x20;
-pub const VM_HUGETLB: u32 = 0x40;
-pub const VM_PFNMAP: u32 = 0x80;
-pub struct VmRegion {
-    pub base: usize,
-    pub len: usize,
-    pub flags: u32,
-    pub offset: usize, // confusing, but not actually used
-    pub tag: u16,
-    pub ref_count: AtomicUsize,
-}
-impl VmRegion {
-    pub fn new(base: usize, len: usize, flags: u32) -> Self {
-        Self {
-            base,
-            len,
-            flags,
-            offset: 0,
-            tag: 0,
-            ref_count: AtomicUsize::new(1),
-        }
-    }
-
-    pub fn with_offset(base: usize, len: usize, flags: u32, offset: usize) -> Self {
-        Self {
-            base,
-            len,
-            flags,
-            offset,
-            tag: 0,
-            ref_count: AtomicUsize::new(1),
-        }
-    }
-
-    pub fn end(&self) -> usize {
-        self.base + self.len
-    }
-
-    pub fn contains(&self, addr: usize) -> bool {
-        addr >= self.base && addr < self.base + self.len
-    }
-
-    pub fn overlaps(&self, other: &VmRegion) -> bool {
-        let a_end = self.base.wrapping_add(self.len);
-        let b_end = other.base.wrapping_add(other.len);
-        let no_overlap = a_end <= other.base || b_end < self.base;
-        !no_overlap
-    }
-
-    pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
-        let e = self.base + self.len;
-        if !self.contains(addr) {
-            return None;
-        }
-        let ll = addr - self.base;
-        let rl = self.len - ll;
-        let lo = self.offset;
-        let ro = self.offset.wrapping_add(ll);
-        let mut lf = self.flags;
-        let mut rf = self.flags;
-        lf &= !VM_GROWSDOWN;
-
-        let l = VmRegion {
-            base: self.base,
-            len: ll,
-            flags: lf,
-            offset: lo,
-            tag: self.tag,
-            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)),
-        };
-        let r = VmRegion {
-            base: addr,
-            len: rl,
-            flags: rf,
-            offset: ro,
-            tag: self.tag,
-            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)),
-        };
-        Some((l, r))
-    }
-
-    pub fn merge_with(&self, other: &VmRegion) -> Option<VmRegion> {
-        let se = self.base + self.len;
-        if se != other.base {
-            return None;
-        }
-        if self.flags != other.flags {
-            return None;
-        }
-        if self.tag != other.tag {
-            return None;
-        }
-        let combined = VmRegion {
-            base: self.base,
-            len: self.len + other.len,
-            flags: self.flags,
-            offset: self.offset,
-            tag: self.tag,
-            ref_count: AtomicUsize::new(
-                self.ref_count
-                    .load(Ordering::Relaxed)
-                    .max(other.ref_count.load(Ordering::Relaxed)),
-            ),
-        };
-        Some(combined)
-    }
-
-    pub fn ref_up(&self) -> usize {
-        self.ref_count.fetch_add(1, Ordering::Relaxed)
-    }
-    pub fn ref_down(&self) -> usize {
-        self.ref_count.fetch_sub(1, Ordering::Relaxed)
-    }
-    pub fn ref_get(&self) -> usize {
-        self.ref_count.load(Ordering::Relaxed)
-    }
-}
-
-pub struct VmMap {
-    pub regions: Vec<VmRegion>,
-    pub brk: usize,
-    pub mmap_base: usize,
-}
-impl VmMap {
-    pub fn new() -> Self {
-        Self {
-            regions: Vec::new(),
-            brk: 0x0040_0000,
-            mmap_base: 0x7000_0000,
-        }
-    }
-
-    pub fn insert(&mut self, region: VmRegion) -> Result<(), &'static str> {
-        let mut idx = 0;
-        while idx < self.regions.len() {
-            if region.overlaps(&self.regions[idx]) {
-                return Err("overlap");
-            }
-            if self.regions[idx].base > region.base {
-                break;
-            }
-            idx += 1;
-        }
-        self.regions.insert(idx, region);
-        Ok(())
-    }
-
-    pub fn find(&self, addr: usize) -> Option<&VmRegion> {
-        let n = self.regions.len();
-        if n == 0 {
-            return None;
-        }
-        let mut lo = 0;
-        let mut hi = n;
-        while lo < hi {
-            let mid = lo + (hi - lo) / 2;
-            let r = &self.regions[mid];
-            if addr < r.base {
-                hi = mid;
-            } else if addr >= r.base + r.len {
-                lo = mid + 1;
-            } else {
-                return Some(r);
-            }
-        }
-        None
-    }
-
-    pub fn remove_range(&mut self, base: usize, len: usize) -> usize {
-        let end = base.wrapping_add(len);
-        let before = self.regions.len();
-        let mut i = 0;
-        while i < self.regions.len() {
-            let rb = self.regions[i].base;
-            let re = rb + self.regions[i].len;
-            if rb >= base && re <= end {
-                self.regions.remove(i);
-            } else if rb < end && re > base {
-                self.regions.remove(i);
-            } else {
-                i += 1;
-            }
-        }
-        before - self.regions.len()
-    }
-
-    pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
-        if len == 0 {
-            return Some(self.mmap_base);
-        }
-        let al = if align > 1 { align } else { PAGE_SZ };
-        let al_mask = al - 1;
-        let mut candidate = (self.mmap_base + al_mask) & !al_mask;
-        let mut iters = 0;
-        let max_iters = self.regions.len() + 2;
-        while iters < max_iters {
-            if candidate.wrapping_add(len) > KERN_BASE || candidate.wrapping_add(len) < candidate {
-                return None;
-            }
-            let ce = candidate + len;
-            let mut conflict_end = 0usize;
-            let mut hit = false;
-            for r in self.regions.iter() {
-                let rb = r.base;
-                let re = rb + r.len;
-                if rb < ce && candidate < re {
-                    conflict_end = re;
-                    hit = true;
-                    break;
-                }
-            }
-            if !hit {
-                return Some(candidate);
-            }
-            candidate = (conflict_end + al_mask) & !al_mask;
-            iters += 1;
-        }
-        None
-    }
-
-    pub fn total_mapped(&self) -> usize {
-        let mut s = 0usize;
-        for r in self.regions.iter() {
-            s = s.wrapping_add(r.len);
-        }
-        s
-    }
-
-    pub fn clone_regions(&self) -> Vec<VmRegion> {
-        let mut out = Vec::with_capacity(self.regions.len());
-        for r in self.regions.iter() {
-            let nr = VmRegion {
-                base: r.base,
-                len: r.len,
-                flags: r.flags,
-                offset: r.offset,
-                tag: r.tag,
-                ref_count: AtomicUsize::new(r.ref_count.load(Ordering::Relaxed)),
-            };
-            out.push(nr);
-        }
-        out
-    }
-
-    pub fn gap_after(&self, idx: usize) -> usize {
-        if idx >= self.regions.len() {
-            return 0;
-        }
-        let re = self.regions[idx].base + self.regions[idx].len;
-        if idx + 1 < self.regions.len() {
-            self.regions[idx + 1].base.saturating_sub(re)
-        } else {
-            KERN_BASE.saturating_sub(re)
-        }
-    }
-}
 
 /*
     Physical page allocator
@@ -1848,6 +1584,273 @@ pub fn frame_alloc_contig(pool: &FramePool, sz: usize, align: usize) -> Option<u
 }
 
 /*
+    Virtual Memory
+    lack of page table and mapping/unmapping function, just a list of regions
+    mapped when page fault occurs?
+*/
+pub const VM_READ: u32 = 0x01;
+pub const VM_WRITE: u32 = 0x02;
+pub const VM_EXEC: u32 = 0x04;
+pub const VM_SHARED: u32 = 0x08;
+pub const VM_GROWSDOWN: u32 = 0x10;
+pub const VM_DONTCOPY: u32 = 0x20;
+pub const VM_HUGETLB: u32 = 0x40;
+pub const VM_PFNMAP: u32 = 0x80;
+pub struct VmRegion {
+    pub base: usize,
+    pub len: usize,
+    pub flags: u32,
+    pub offset: usize, // confusing, but not actually used
+    pub tag: u16,
+    pub ref_count: AtomicUsize,
+}
+impl VmRegion {
+    pub fn new(base: usize, len: usize, flags: u32) -> Self {
+        Self {
+            base,
+            len,
+            flags,
+            offset: 0,
+            tag: 0,
+            ref_count: AtomicUsize::new(1),
+        }
+    }
+
+    pub fn with_offset(base: usize, len: usize, flags: u32, offset: usize) -> Self {
+        Self {
+            base,
+            len,
+            flags,
+            offset,
+            tag: 0,
+            ref_count: AtomicUsize::new(1),
+        }
+    }
+
+    pub fn end(&self) -> usize {
+        self.base + self.len
+    }
+
+    pub fn contains(&self, addr: usize) -> bool {
+        addr >= self.base && addr < self.base + self.len
+    }
+
+    pub fn overlaps(&self, other: &VmRegion) -> bool {
+        let a_end = self.base.wrapping_add(self.len);
+        let b_end = other.base.wrapping_add(other.len);
+        let no_overlap = a_end <= other.base || b_end < self.base;
+        !no_overlap
+    }
+
+    pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
+        let e = self.base + self.len;
+        if !self.contains(addr) {
+            return None;
+        }
+        let ll = addr - self.base;
+        let rl = self.len - ll;
+        let lo = self.offset;
+        let ro = self.offset.wrapping_add(ll);
+        let mut lf = self.flags;
+        let mut rf = self.flags;
+        lf &= !VM_GROWSDOWN;
+
+        let l = VmRegion {
+            base: self.base,
+            len: ll,
+            flags: lf,
+            offset: lo,
+            tag: self.tag,
+            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)),
+        };
+        let r = VmRegion {
+            base: addr,
+            len: rl,
+            flags: rf,
+            offset: ro,
+            tag: self.tag,
+            ref_count: AtomicUsize::new(self.ref_count.load(Ordering::Relaxed)),
+        };
+        Some((l, r))
+    }
+
+    pub fn merge_with(&self, other: &VmRegion) -> Option<VmRegion> {
+        let se = self.base + self.len;
+        if se != other.base {
+            return None;
+        }
+        if self.flags != other.flags {
+            return None;
+        }
+        if self.tag != other.tag {
+            return None;
+        }
+        let combined = VmRegion {
+            base: self.base,
+            len: self.len + other.len,
+            flags: self.flags,
+            offset: self.offset,
+            tag: self.tag,
+            ref_count: AtomicUsize::new(
+                self.ref_count
+                    .load(Ordering::Relaxed)
+                    .max(other.ref_count.load(Ordering::Relaxed)),
+            ),
+        };
+        Some(combined)
+    }
+
+    pub fn ref_up(&self) -> usize {
+        self.ref_count.fetch_add(1, Ordering::Relaxed)
+    }
+    pub fn ref_down(&self) -> usize {
+        self.ref_count.fetch_sub(1, Ordering::Relaxed)
+    }
+    pub fn ref_get(&self) -> usize {
+        self.ref_count.load(Ordering::Relaxed)
+    }
+}
+
+pub struct VmMap {
+    pub regions: Vec<VmRegion>,
+    pub brk: usize, // program break
+    pub mmap_base: usize,
+}
+impl VmMap {
+    pub fn new() -> Self {
+        Self {
+            regions: Vec::new(),
+            brk: 0x0040_0000,
+            mmap_base: 0x7000_0000,
+        }
+    }
+
+    pub fn insert(&mut self, region: VmRegion) -> Result<(), &'static str> {
+        let mut idx = 0;
+        while idx < self.regions.len() {
+            if region.overlaps(&self.regions[idx]) {
+                return Err("overlap");
+            }
+            if self.regions[idx].base > region.base {
+                break;
+            }
+            idx += 1;
+        }
+        self.regions.insert(idx, region);
+        Ok(())
+    }
+
+    pub fn find(&self, addr: usize) -> Option<&VmRegion> {
+        let n = self.regions.len();
+        if n == 0 {
+            return None;
+        }
+        let mut lo = 0;
+        let mut hi = n;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            let r = &self.regions[mid];
+            if addr < r.base {
+                hi = mid;
+            } else if addr >= r.base + r.len {
+                lo = mid + 1;
+            } else {
+                return Some(r);
+            }
+        }
+        None
+    }
+
+    pub fn remove_range(&mut self, base: usize, len: usize) -> usize {
+        let end = base.wrapping_add(len);
+        let before = self.regions.len();
+        let mut i = 0;
+        while i < self.regions.len() {
+            let rb = self.regions[i].base;
+            let re = rb + self.regions[i].len;
+            if rb >= base && re <= end {
+                self.regions.remove(i);
+            } else if rb < end && re > base {
+                self.regions.remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        before - self.regions.len()
+    }
+
+    pub fn find_free(&self, len: usize, align: usize) -> Option<usize> {
+        if len == 0 {
+            return Some(self.mmap_base);
+        }
+        let al = if align > 1 { align } else { PAGE_SZ };
+        let al_mask = al - 1;
+        let mut candidate = (self.mmap_base + al_mask) & !al_mask;
+        let mut iters = 0;
+        let max_iters = self.regions.len() + 2;
+        while iters < max_iters {
+            if candidate.wrapping_add(len) > KERN_BASE || candidate.wrapping_add(len) < candidate {
+                return None;
+            }
+            let ce = candidate + len;
+            let mut conflict_end = 0usize;
+            let mut hit = false;
+            for r in self.regions.iter() {
+                let rb = r.base;
+                let re = rb + r.len;
+                if rb < ce && candidate < re {
+                    conflict_end = re;
+                    hit = true;
+                    break;
+                }
+            }
+            if !hit {
+                return Some(candidate);
+            }
+            candidate = (conflict_end + al_mask) & !al_mask;
+            iters += 1;
+        }
+        None
+    }
+
+    pub fn total_mapped(&self) -> usize {
+        let mut s = 0usize;
+        for r in self.regions.iter() {
+            s = s.wrapping_add(r.len);
+        }
+        s
+    }
+
+    pub fn clone_regions(&self) -> Vec<VmRegion> {
+        let mut out = Vec::with_capacity(self.regions.len());
+        for r in self.regions.iter() {
+            let nr = VmRegion {
+                base: r.base,
+                len: r.len,
+                flags: r.flags,
+                offset: r.offset,
+                tag: r.tag,
+                ref_count: AtomicUsize::new(r.ref_count.load(Ordering::Relaxed)),
+            };
+            out.push(nr);
+        }
+        out
+    }
+
+    pub fn gap_after(&self, idx: usize) -> usize {
+        if idx >= self.regions.len() {
+            return 0;
+        }
+        let re = self.regions[idx].base + self.regions[idx].len;
+        if idx + 1 < self.regions.len() {
+            self.regions[idx + 1].base.saturating_sub(re)
+        } else {
+            KERN_BASE.saturating_sub(re)
+        }
+    }
+}
+
+/*
     Track how many processes share the same physical page
 */
 pub struct PgFrame {
@@ -1899,7 +1902,6 @@ impl PgFrame {
 }
 
 /*
-
     Similar to AddrSpace.handle_cow_fault
 
     skip
@@ -1961,6 +1963,133 @@ pub fn v2p(va: usize) -> usize {
 // Kernel offset from base
 pub fn k_off(va: usize) -> usize {
     va.wrapping_sub(KERN_BASE)
+}
+
+pub struct AddrSpace {
+    pub vm_map: VmMap,
+    pub page_table_root: usize, // still no real mapping, just a placeholder
+    pub asid: u16,
+    pub ref_count: AtomicUsize,
+    pub cow_pages: Mutex<BTreeMap<usize, PgFrame>>, 
+    // each physical page has a reference count, shared between processes
+}
+impl AddrSpace {
+    pub fn new(asid: u16) -> Self {
+        Self {
+            vm_map: VmMap::new(),
+            page_table_root: 0,
+            asid,
+            ref_count: AtomicUsize::new(1),
+            cow_pages: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn fork_from(parent: &AddrSpace, new_asid: u16) -> Self {
+        let mut child = Self::new(new_asid);
+        child.vm_map.brk = parent.vm_map.brk;
+        child.vm_map.mmap_base = parent.vm_map.mmap_base;
+        child.vm_map.regions = parent.clone_regions();
+        {
+            let parent_cow = parent.cow_pages.lock().unwrap();
+            let mut child_cow = child.cow_pages.lock().unwrap();
+            for (&addr, frame) in parent_cow.iter() {
+                frame.up();
+                child_cow.insert(addr, PgFrame::with_rc(frame.count()));
+            }
+            // assume child shares the same physical memories with parent
+            // the region is only readable now?
+        }
+        for region in parent.vm_map.regions.iter() {
+            if region.flags & VM_WRITE != 0 {
+                region.ref_up();
+            }
+        }
+        child
+    }
+
+    pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
+        // write on addr(child and parent share the same physical page)
+        let page_addr = addr & !(PAGE_SZ - 1);
+        let region = self.vm_map.find(addr).ok_or("segfault")?;
+        if region.flags & VM_WRITE == 0 {
+            return Err("segfault");
+        }
+        let mut cow = self.cow_pages.lock().unwrap();
+        if let Some(frame) = cow.get(&page_addr) {
+            let rc = frame.count();
+            if rc <= 1 {
+                return Ok(page_addr);
+            }
+            let new_frame_id = pool.get_inner().ok_or("oom")?;
+            frame.down();
+            let new_frame = PgFrame::with_rc(1);
+            cow.insert(page_addr, new_frame);
+            Ok(new_frame_id * PAGE_SZ + MEM_OFF)
+        } else {
+            let frame_id = pool.get_inner().ok_or("oom")?;
+            cow.insert(page_addr, PgFrame::with_rc(1));
+            Ok(frame_id * PAGE_SZ + MEM_OFF)
+        }
+    }
+
+    pub fn unmap_range(&mut self, start: usize, len: usize) -> usize {
+        let end = start + len;
+        let removed = self.vm_map.remove_range(start, len);
+        let mut cow = self.cow_pages.lock().unwrap();
+        let pages_to_remove: Vec<usize> = cow
+            .keys()
+            .filter(|&&addr| addr >= start && addr < end)
+            .copied()
+            .collect();
+        for addr in &pages_to_remove {
+            if let Some(frame) = cow.remove(addr) {
+                frame.down();
+            }
+        }
+        removed + pages_to_remove.len()
+    }
+
+    pub fn protect(
+        &mut self,
+        start: usize,
+        len: usize,
+        new_flags: u32,
+    ) -> Result<(), &'static str> {
+        let end = start + len;
+        let mut affected = Vec::new();
+        for (i, r) in self.vm_map.regions.iter().enumerate() {
+            if r.base < end && r.end() > start {
+                affected.push(i);
+            }
+        }
+        for &idx in affected.iter().rev() {
+            if idx < self.vm_map.regions.len() {
+                self.vm_map.regions[idx].flags = new_flags;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn rss_pages(&self) -> usize {
+        self.cow_pages.lock().unwrap().len()
+    }
+
+    pub fn cow_sharers(&self) -> usize {
+        let cow = self.cow_pages.lock().unwrap();
+        cow.values().filter(|f| f.count() > 1).count()
+    }
+
+    pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
+        let region = self.vm_map.find(addr).ok_or("enomem")?;
+        let offset = addr - region.base;
+        if offset == 0 || offset >= region.len {
+            return Err("einval");
+        }
+        let second = VmRegion::new(addr, region.len - offset, region.flags);
+        region.len = offset;
+        self.vm_map.regions.push(second);
+        Ok(())
+    }
 }
 
 pub const KernelStack_SZ: usize = 0x4000;
@@ -7298,134 +7427,4 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
         }
     }
     None
-}
-
-pub struct AddrSpace {
-    pub vm_map: VmMap,
-    pub page_table_root: usize,
-    pub asid: u16,
-    pub ref_count: AtomicUsize,
-    pub cow_pages: Mutex<BTreeMap<usize, PgFrame>>,
-}
-
-impl AddrSpace {
-    pub fn new(asid: u16) -> Self {
-        Self {
-            vm_map: VmMap::new(),
-            page_table_root: 0,
-            asid,
-            ref_count: AtomicUsize::new(1),
-            cow_pages: Mutex::new(BTreeMap::new()),
-        }
-    }
-
-    pub fn fork_from(parent: &AddrSpace, new_asid: u16) -> Self {
-        let mut child = Self::new(new_asid);
-        child.vm_map.brk = parent.vm_map.brk;
-        child.vm_map.mmap_base = parent.vm_map.mmap_base;
-        for region in parent.vm_map.regions.iter() {
-            let new_region = VmRegion::new(region.base, region.len, region.flags);
-            new_region.ref_count.store(1, Ordering::Relaxed);
-            if region.flags & VM_WRITE != 0 {
-                region.ref_up();
-            }
-            let _ = child.vm_map.insert(new_region);
-        }
-        {
-            let parent_cow = parent.cow_pages.lock().unwrap();
-            let mut child_cow = child.cow_pages.lock().unwrap();
-            for (&addr, frame) in parent_cow.iter() {
-                frame.up();
-                child_cow.insert(addr, PgFrame::with_rc(frame.count()));
-            }
-        }
-        for region in parent.vm_map.regions.iter() {
-            if region.flags & VM_WRITE != 0 {
-                region.ref_up();
-            }
-        }
-        child
-    }
-
-    pub fn handle_cow_fault(&self, addr: usize, pool: &FramePool) -> Result<usize, &'static str> {
-        let page_addr = addr & !(PAGE_SZ - 1);
-        let region = self.vm_map.find(addr).ok_or("segfault")?;
-        if region.flags & VM_WRITE == 0 {
-            return Err("segfault");
-        }
-        let mut cow = self.cow_pages.lock().unwrap();
-        if let Some(frame) = cow.get(&page_addr) {
-            let rc = frame.count();
-            if rc <= 1 {
-                return Ok(page_addr);
-            }
-            let new_frame_id = pool.get_inner().ok_or("oom")?;
-            frame.down();
-            let new_frame = PgFrame::with_rc(1);
-            cow.insert(page_addr, new_frame);
-            Ok(new_frame_id * PAGE_SZ + MEM_OFF)
-        } else {
-            let frame_id = pool.get_inner().ok_or("oom")?;
-            cow.insert(page_addr, PgFrame::with_rc(1));
-            Ok(frame_id * PAGE_SZ + MEM_OFF)
-        }
-    }
-
-    pub fn unmap_range(&mut self, start: usize, len: usize) -> usize {
-        let end = start + len;
-        let removed = self.vm_map.remove_range(start, len);
-        let mut cow = self.cow_pages.lock().unwrap();
-        let pages_to_remove: Vec<usize> = cow
-            .keys()
-            .filter(|&&addr| addr >= start && addr < end)
-            .copied()
-            .collect();
-        for addr in &pages_to_remove {
-            if let Some(frame) = cow.remove(addr) {
-                frame.down();
-            }
-        }
-        removed + pages_to_remove.len()
-    }
-
-    pub fn protect(
-        &mut self,
-        start: usize,
-        len: usize,
-        new_flags: u32,
-    ) -> Result<(), &'static str> {
-        let end = start + len;
-        let mut affected = Vec::new();
-        for (i, r) in self.vm_map.regions.iter().enumerate() {
-            if r.base < end && r.end() > start {
-                affected.push(i);
-            }
-        }
-        for &idx in affected.iter().rev() {
-            if idx < self.vm_map.regions.len() {
-                self.vm_map.regions[idx].flags = new_flags;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn rss_pages(&self) -> usize {
-        self.cow_pages.lock().unwrap().len()
-    }
-
-    pub fn cow_sharers(&self) -> usize {
-        let cow = self.cow_pages.lock().unwrap();
-        cow.values().filter(|f| f.count() > 1).count()
-    }
-
-    pub fn split_region(&mut self, addr: usize) -> Result<(), &'static str> {
-        let region = self.vm_map.find(addr).ok_or("enomem")?;
-        let offset = addr - region.base;
-        if offset == 0 || offset >= region.len {
-            return Err("einval");
-        }
-        let second = VmRegion::new(addr, region.len - offset, region.flags);
-        self.vm_map.regions.push(second);
-        Ok(())
-    }
 }
