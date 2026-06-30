@@ -4082,7 +4082,7 @@ impl TimerWheel {
     }
 }
 
-pub struct KObjEntry {
+pub struct KernelObjectEntry {
     pub obj_id: usize,
     pub type_tag: u32,
     pub owner_pid: usize,
@@ -4091,13 +4091,13 @@ pub struct KObjEntry {
     pub parent_id: Option<usize>,
 }
 
-pub struct KObjRegistry {
-    pub objects: Mutex<BTreeMap<usize, KObjEntry>>,
+pub struct KernelObjectRegistry {
+    pub objects: Mutex<BTreeMap<usize, KernelObjectEntry>>,
     pub seq: AtomicUsize,
     pub type_index: Mutex<BTreeMap<u32, Vec<usize>>>,
 }
 
-impl KObjRegistry {
+impl KernelObjectRegistry {
     pub fn new() -> Self {
         Self {
             objects: Mutex::new(BTreeMap::new()),
@@ -4108,7 +4108,7 @@ impl KObjRegistry {
 
     pub fn register(&self, type_tag: u32, owner_pid: usize) -> usize {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
-        let entry = KObjEntry {
+        let entry = KernelObjectEntry {
             obj_id: id,
             type_tag,
             owner_pid,
@@ -4124,7 +4124,7 @@ impl KObjRegistry {
 
     pub fn register_child(&self, type_tag: u32, owner_pid: usize, parent: usize) -> usize {
         let id = self.seq.fetch_add(1, Ordering::Relaxed);
-        let entry = KObjEntry {
+        let entry = KernelObjectEntry {
             obj_id: id,
             type_tag,
             owner_pid,
@@ -4171,6 +4171,7 @@ impl KObjRegistry {
         edges
     }
 
+    // garbage collection: sweep objects with ref_count == 0
     pub fn gc_sweep(&self) -> usize {
         let mut objs = self.objects.lock().unwrap();
         let dead: Vec<usize> = objs
