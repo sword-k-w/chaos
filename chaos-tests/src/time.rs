@@ -14,6 +14,7 @@ pub const USEC_TICK: usize = 1000;
 pub const BOOT_EPOCH: usize = 1_700_000_000; // [doubtful] the value is uncertain, but probably does not affect the test
 
 // Wall clock
+// total ticks since boot (including kernel time), not affected by CPU idleness
 pub fn wclk() -> usize {
     CLK.load(Ordering::Relaxed)
 }

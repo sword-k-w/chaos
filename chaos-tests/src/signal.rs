@@ -19,22 +19,22 @@ pub struct IpcPermission {
     pub key: u32,
     pub uid: u32, // owner
     pub gid: u32,
-    pub cuid: u32,
-    pub cgid: u32, // creator
+    pub cuid: u32, // creator
+    pub cgid: u32, 
     pub mode: u32,
     pub seq: u32,
-    pub pad1: usize,
-    pub pad2: usize,
+    pad1: usize,
+    pad2: usize,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct SemDs {
+pub struct SemDs { // semaphore data set, metadata
     pub perm: IpcPermission,
-    pub otime: usize,
-    _p1: usize,
-    pub ctime: usize,
-    _p2: usize,
+    pub otime: usize, // ?
+    _p1: usize,    // padding
+    pub ctime: usize, // ?
+    _p2: usize,    // padding
     pub nsems: usize,
 }
 
@@ -70,7 +70,7 @@ impl SemArr {
         key: u32,
         nsems: usize,
         flags: usize,
-        store: &RwLock<BTreeMap<u32, Weak<SemArr>>>,
+        store: &RwLock<BTreeMap<u32, Weak<SemArr>>>, // strange, not consistent with SemCtx
     ) -> Result<Arc<Self>, &'static str> {
         let mut m = store.write().unwrap();
         let mut k = key;
@@ -125,7 +125,7 @@ pub struct SemCtx {
 }
 impl SemCtx {
     pub fn add(&mut self, arr: Arc<SemArr>) -> SemId {
-        let id = (0..).find(|i| !self.arrays.contains_key(i)).unwrap();
+        let id = self.free_id();
         self.arrays.insert(id, arr);
         id
     }
