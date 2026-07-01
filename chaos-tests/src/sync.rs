@@ -12,6 +12,12 @@ use crate::util::*;
 
 /*
     Synchronization
+
+    Release  - fixed
+    Relaxed  \
+    Relaxed    can be reordered
+    Relaxed  /
+    Acquire  - fixed
 */
 pub struct Spin {
     v: AtomicBool,
@@ -148,6 +154,11 @@ impl EventBitflag {
     pub const SEMAPHORE_AVAILABLE: u32 = 1 << 21;
 }
 
+/*
+    When an event occurs(event bitflag is set), all registered callbacks are called.
+
+    If a callback returns true, it will be removed from the list of callbacks.
+*/
 #[derive(Default)]
 pub struct EventBus {
     pub event: u32,
@@ -190,7 +201,7 @@ pub fn wait_ev(bus: &Arc<Mutex<EventBus>>, mask: u32) -> u32 {
                 return g.event;
             }
         }
-        thread::yield_now();
+        yield_now_sync()
     }
 }
 
@@ -205,6 +216,8 @@ pub struct Semaphore {
     inner: Arc<Mutex<SemaphoreInner>>,
 }
 
+// Guard is used to automatically release the semaphore when it goes out of scope.
+// 'a ensures that the guard cannot outlive the semaphore it is guarding.
 pub struct SemaphoreGuard<'a> {
     s: &'a Semaphore,
 }
@@ -249,9 +262,9 @@ impl Semaphore {
     }
     pub fn acquire_spin(&self) -> Result<(), &'static str> {
         loop {
-            match self.try_acquire()? {
+            match self.try_acquire()? { // return Err immediately if semaphore is removed
                 true => return Ok(()),
-                false => thread::yield_now(),
+                false => yield_now_sync(),
             }
         }
     }
@@ -282,7 +295,7 @@ impl Semaphore {
 
 impl<'a> Drop for SemaphoreGuard<'a> {
     fn drop(&mut self) {
-        self.s.release();
+        self.s.remove(); 
     }
 }
 impl<'a> Deref for SemaphoreGuard<'a> {
@@ -301,6 +314,13 @@ impl FutexBucket {
             waiters: Mutex::new(VecDeque::new()),
         }
     }
+    /*
+        User acquires the futex through CAS first.
+        If success, no need to wait.
+        Otherwise, wait => 
+            first ensure the value is still the same as expected, otherwise return immediately.
+            then add to waiters and park the thread.
+    */
     pub fn wait(
         &self,
         addr: usize,
@@ -321,7 +341,7 @@ impl FutexBucket {
         } else {
             thread::park();
         }
-        if flag.load(Ordering::Relaxed) {
+        if flag.load(Ordering::Acquire) {
             Ok(())
         } else {
             Err("timeout")
@@ -332,7 +352,7 @@ impl FutexBucket {
         let mut woken = 0;
         w.retain(|(a, t, f)| {
             if *a == addr && woken < count {
-                f.store(true, Ordering::Relaxed);
+                f.store(true, Ordering::Release);
                 t.unpark();
                 woken += 1;
                 false
@@ -342,13 +362,17 @@ impl FutexBucket {
         });
         woken
     }
+    /*
+        Requeue waiters from src to dst.
+        Wake up to wake_n waiters at src, and move up to move_n waiters from src to dst.
+    */
     pub fn requeue(&self, src: usize, dst: usize, wake_n: usize, move_n: usize) -> usize {
         let mut w = self.waiters.lock().unwrap();
         let (mut wk, mut mv) = (0, 0);
         for e in w.iter_mut() {
             if e.0 == src {
                 if wk < wake_n {
-                    e.2.store(true, Ordering::Relaxed);
+                    e.2.store(true, Ordering::Release);
                     e.1.unpark();
                     wk += 1;
                 } else if mv < move_n {
@@ -357,7 +381,7 @@ impl FutexBucket {
                 }
             }
         }
-        w.retain(|(_, _, f)| !f.load(Ordering::Relaxed));
+        w.retain(|(_, _, f)| !f.load(Ordering::Acquire));
         wk
     }
     pub fn pending_at(&self, addr: usize) -> usize {
@@ -370,10 +394,12 @@ impl FutexBucket {
     }
 }
 
+/*
+    Similar to FutexBucket, but simpler. No timeout, no requeue.
+*/
 pub struct FutexTable {
     table: Mutex<VecDeque<(usize, thread::Thread)>>,
 }
-
 impl FutexTable {
     pub fn new() -> Self {
         Self {
@@ -445,12 +471,6 @@ impl FutexTable {
         }
         wk
     }
-}
-
-pub struct RegEpoll {
-    pub task_id: usize,
-    pub epfd: usize,
-    pub fd: usize,
 }
 
 // maybe wake-up lose, similar handle to SyncQueue. skip it
@@ -536,6 +556,12 @@ impl WaitQueue {
     }
 }
 
+// ?
+pub struct RegEpoll {
+    pub task_id: usize,
+    pub epfd: usize,
+    pub fd: usize,
+}
 pub struct SyncQueue {
     q: Mutex<VecDeque<thread::Thread>>,
     eq: Mutex<VecDeque<RegEpoll>>,
@@ -611,6 +637,8 @@ impl SyncQueue {
         let q = self.q.lock().unwrap();
         q.len()
     }
+    // strange
+    // not understand
     pub fn wait_ev<T>(&self, g: &Mutex<T>, mut cond: impl FnMut(&T) -> Option<bool>) -> bool {
         loop {
             {
