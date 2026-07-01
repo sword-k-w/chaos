@@ -778,3 +778,7 @@ impl Channel {
         self.buf.lock().unwrap().remaining()
     }
 }
+
+pub fn yield_now_sync() {
+    thread::yield_now();
+}

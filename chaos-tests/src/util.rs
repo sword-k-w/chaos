@@ -217,6 +217,7 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
 /*
     Data Structures
 */
+pub const RBUF_CAP: usize = 256;
 pub struct CircBuf {
     pub data: Vec<u8>,
     pub head: usize,

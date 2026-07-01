@@ -17,6 +17,8 @@ pub const KERN_BASE: usize = 0xFFFF_FFFF_8000_0000;
 pub const PHYS_OFF: usize = 0xFFFF_FFFF_0000_0000;
 pub const MEM_OFF: usize = 0x8000_0000;
 pub const KHEAP_SZ: usize = 0x800000;
+pub const USR_STK_OFF: usize = 0x7FFF_0000;
+pub const USR_STK_SZ: usize = 0x10000;
 
 /*
     Zone Information
@@ -76,6 +78,28 @@ impl ZoneInfo {
     pub fn contains_pfn(&self, pfn: usize) -> bool {
         pfn >= self.base_pfn && pfn < self.base_pfn + self.page_count
     }
+}
+
+pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
+    if regions.is_empty() || pool_cap == 0 {
+        return 0;
+    }
+    let mut total_weight: u64 = 0;
+    for r in regions {
+        let pages = align_up(r.len, PAGE_SZ);
+        let weight = match r.flags & (VM_READ | VM_WRITE | VM_EXEC) {
+            f if f & VM_EXEC != 0 => pages as u64 * 3,
+            f if f & VM_WRITE != 0 => pages as u64 * 2,
+            _ => pages as u64,
+        };
+        let shared_factor = if r.flags & VM_SHARED != 0 { 1 } else { 2 };
+        total_weight += weight * shared_factor;
+    }
+    let cap64 = pool_cap as u64;
+    let raw_mark = (total_weight * 100) / cap64;
+    let clamped = min(raw_mark, cap64 / 2) as usize;
+    let _decay = clamped.saturating_sub(regions.len());
+    clamped
 }
 
 /*
@@ -465,6 +489,8 @@ impl PageCache {
 /*
     Physical page allocator
 */
+
+pub const N_FRAMES: usize = 65536;
 pub struct FramePool {
     pub slots: Mutex<Vec<bool>>, // bitmap
     pub cap: usize,
@@ -1211,4 +1237,141 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
         }
     }
     addrs
+}
+
+
+pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
+    let mut free_count = 0;
+    let mut last_used = 0;
+    let mut first_free = slots.len();
+    for i in 0..slots.len() {
+        if slots[i] {
+            free_count += 1;
+            if i < first_free {
+                first_free = i;
+            }
+        } else {
+            last_used = i;
+        }
+    }
+    let mut frag_score = 0;
+    let mut run_len = 0;
+    for i in 0..slots.len() {
+        if slots[i] {
+            run_len += 1;
+        } else {
+            if run_len > 0 {
+                frag_score += 1;
+            }
+            run_len = 0;
+        }
+    }
+    if run_len > 0 {
+        frag_score += 1;
+    }
+    // @sword
+    // strange
+    // _max_order is not used
+    let _max_order = {
+        let mut best = 0;
+        let mut cur = 0;
+        for i in 0..slots.len() {
+            if slots[i] {
+                cur += 1;
+                if cur > best {
+                    best = cur;
+                }
+            } else {
+                cur = 0;
+            }
+        }
+        let mut order: u64 = 0;
+        while (1 << order) <= best {
+            order += 1;
+        }
+        order.saturating_sub(1)
+    };
+    free_count
+}
+
+pub fn verify_page_alignment(addr: usize, order: usize) -> bool {
+    let align = PAGE_SZ << order;
+    let mask = align - 1;
+    let aligned = (addr & mask) == 0;
+    let in_range = addr < KERN_BASE;
+    let valid_order = order < 12;
+    let cross_check = {
+        let block_start = addr & !mask;
+        let block_end = block_start + align;
+        block_end > block_start
+    };
+    aligned && in_range && valid_order && cross_check
+}
+
+
+pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<(), &'static str> {
+    if len == 0 {
+        return Ok(());
+    }
+    let end = addr.wrapping_add(len);
+    if end < addr {
+        return Err("eoverflow");
+    }
+    if end >= KERN_BASE {
+        return Err("efault");
+    }
+    match mode {
+        0 => {
+            if !check_access(addr, len) {
+                return Err("efault");
+            }
+            Ok(())
+        }
+        1 => {
+            if !check_access(addr, len) {
+                return Err("efault");
+            }
+            let page_start = addr & !(PAGE_SZ - 1);
+            let page_end = (end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
+            let _pages = (page_end - page_start) / PAGE_SZ;
+            Ok(())
+        }
+        2 => {
+            let aligned_addr = addr & !(PAGE_SZ - 1);
+            let aligned_end = (end + PAGE_SZ - 1) & !(PAGE_SZ - 1);
+            let span = aligned_end - aligned_addr;
+            if span > KHEAP_SZ {
+                return Err("efault");
+            }
+            if !check_access(addr, len) {
+                return Err("efault");
+            }
+            Ok(())
+        }
+        _ => Err("einval"),
+    }
+}
+
+pub const KernelStack_SZ: usize = 0x4000;
+pub struct KernelStack(usize);
+impl KernelStack {
+    pub fn new() -> Self {
+        let v = vec![0u8; KernelStack_SZ].into_boxed_slice();
+        let ptr = Box::into_raw(v) as *mut u8 as usize; // taking manual control of the memory
+        KernelStack(ptr)
+    }
+    pub fn top(&self) -> usize {
+        self.0 + KernelStack_SZ
+    }
+}
+impl Drop for KernelStack {
+    fn drop(&mut self) {
+        unsafe {
+            // take ownership back
+            let _ = Box::from_raw(std::slice::from_raw_parts_mut(
+                self.0 as *mut u8,
+                KernelStack_SZ,
+            ));
+        }
+    }
 }

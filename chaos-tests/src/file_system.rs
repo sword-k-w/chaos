@@ -414,6 +414,7 @@ impl Disk {
     }
 }
 
+pub const N_CHAINS: usize = 64;
 pub struct CacheSlot {
     pub id: usize,
     pub payload: Vec<u8>,
