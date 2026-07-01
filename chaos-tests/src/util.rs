@@ -279,9 +279,6 @@ impl CircBuf {
             return None;
         }
         let i = self.head.wrapping_add(1) % self.cap;
-        if i >= self.data.len() {
-            return None;
-        }
         Some(self.data[i])
     }
 
