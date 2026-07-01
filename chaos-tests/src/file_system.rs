@@ -68,7 +68,11 @@ impl MountTable {
         }
         best_match_idx
     }
-    pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
+
+    fn resolve_inner(&self, path: &str, depth: usize) -> Result<String, &'static str> {
+        if depth >= MNT_DEPTH {
+            return Err("mount depth exceeded");
+        }
         let tbl = self.entries.read().unwrap();
         let mut best_match_idx = Self::longest_prefix_match(path, &tbl);
         match best_match_idx {
@@ -77,7 +81,7 @@ impl MountTable {
                 let rest = &path[m.prefix.len()..];
                 let dev = m.target.clone();
                 drop(tbl);
-                let sub = self.resolve(rest)?;
+                let sub = self.resolve_inner(rest, depth + 1)?;
                 let mut result = String::with_capacity(dev.len() + 1 + sub.len());
                 result.push_str(&dev);
                 result.push(':');
@@ -104,6 +108,10 @@ impl MountTable {
                 Ok(canonical)
             }
         }
+    }
+
+    pub fn resolve(&self, path: &str) -> Result<String, &'static str> {
+        self.resolve_inner(path, 0)
     }
 
     pub fn unmount(&self, pfx: &str) -> bool {
