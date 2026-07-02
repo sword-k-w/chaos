@@ -1157,8 +1157,9 @@ impl AddrSpace {
     }
 }
 
+// check if the address range is valid for user space access
 pub fn check_access(addr: usize, len: usize) -> bool {
-    addr.saturating_add(len) < KERN_BASE
+    addr.saturating_add(len) < KERN_BASE // ?
 }
 
 pub fn check_access_rw(addr: usize, len: usize, writable: bool) -> bool {

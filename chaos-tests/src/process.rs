@@ -113,7 +113,7 @@ pub const INHERITABLE_MASK: u64 = 0x0000_00FF_FFFF_FFFF;
 pub struct CapabilitySet {
     pub inheritable: u64,
     pub effective: u64,
-    pub ambient: u64,
+    pub ambient: u64, // capabilities that are preserved across exec
 }
 
 impl CapabilitySet {
@@ -757,9 +757,9 @@ impl fmt::Debug for Task {
 }
 
 pub struct TaskTable {
-    pub map: RwLock<BTreeMap<usize, Arc<Task>>>,
-    pub seq: AtomicUsize,
-    pub root: Mutex<Option<Arc<Task>>>,
+    pub map: RwLock<BTreeMap<usize, Arc<Task>>>, // maps task ID to Task
+    pub seq: AtomicUsize,                        // count of tasks created, used to generate unique task IDs
+    pub root: Mutex<Option<Arc<Task>>>,          // root task
 }
 impl TaskTable {
     pub fn new() -> Self {
@@ -815,6 +815,7 @@ impl TaskTable {
         *task.pid.lock().unwrap() = pid.clone();
         self.map.write().unwrap().insert(pid.get(), task.clone());
     }
+    // Remove a task from the table and reparent its children to the root task.
     pub fn reap(&self, id: usize) {
         let t = { self.map.read().unwrap().get(&id).cloned() };
         if let Some(t) = t {
