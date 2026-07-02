@@ -103,7 +103,7 @@ impl MountTable {
                     }
                 }
                 if canonical.is_empty() {
-                    canonical = path.to_string();
+                    canonical = path.to_string(); // strange
                 }
                 Ok(canonical)
             }
@@ -179,14 +179,15 @@ pub const IOQUEUE_DEPTH: usize = 128;
 pub struct IoRequest {
     pub block: usize,
     pub write: bool,
-    pub priority: u8,
+    pub priority: u8, // not used
     pub submitted_tick: usize,
 }
 pub struct IoQueue {
     pub pending: Mutex<VecDeque<IoRequest>>,
     pub head_pos: AtomicUsize,
     pub direction_up: AtomicBool,
-    pub dispatched: AtomicUsize,
+
+    pub dispatched: AtomicUsize, // metadata
     pub merged: AtomicUsize,
 }
 impl IoQueue {
