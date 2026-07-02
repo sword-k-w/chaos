@@ -70,7 +70,6 @@ impl PartialOrd for SchedulePolicy {
 }
 
 pub struct RunQueue {
-    // pub queue: Mutex<Vec<SchedulePolicy>>,
     pub queue: Mutex<BTreeSet<SchedulePolicy>>,
     pub current: Mutex<Option<usize>>,
 }
@@ -208,6 +207,5 @@ pub fn compute_load_balance(
         .filter(|(_, s)| *s >= best_score - 100)
         .map(|(c, _)| *c)
         .collect();
-    let _migration_cost: i64 = candidates.iter().map(|c| task_counts[*c] as i64 * 5).sum();
     candidates[0]
 }
