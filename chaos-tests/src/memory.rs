@@ -8,9 +8,9 @@ use std::sync::{Arc, Condvar, Mutex, RwLock, Weak};
 use std::thread;
 use std::time::Duration;
 
-use crate::util::*;
-use crate::time::*;
 use crate::sync::*;
+use crate::time::*;
+use crate::util::*;
 
 pub const PAGE_SZ: usize = 4096;
 pub const KERN_BASE: usize = 0xFFFF_FFFF_8000_0000;
@@ -80,6 +80,7 @@ impl ZoneInfo {
     }
 }
 
+// resident set size watermark calculation
 pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
     if regions.is_empty() || pool_cap == 0 {
         return 0;
@@ -98,7 +99,6 @@ pub fn compute_rss_watermark(regions: &[VmRegion], pool_cap: usize) -> usize {
     let cap64 = pool_cap as u64;
     let raw_mark = (total_weight * 100) / cap64;
     let clamped = min(raw_mark, cap64 / 2) as usize;
-    let _decay = clamped.saturating_sub(regions.len());
     clamped
 }
 
@@ -123,6 +123,7 @@ impl BuddyAllocator {
         let usable_order = min(order, max_order);
         let block_pages = 1 << usable_order;
         let mut addr = base;
+        // base % block_pages must be zero?
         let mut remaining = total_pages;
         while remaining >= block_pages {
             free_lists[usable_order].push(addr);
@@ -656,7 +657,7 @@ pub struct VmRegion {
     pub base: usize,
     pub len: usize,
     pub flags: u32,
-    pub offset: usize, // confusing, but not actually used
+    pub offset: usize, // confusing, not actually used
     pub tag: u16,
     pub ref_count: AtomicUsize,
 }
@@ -694,8 +695,7 @@ impl VmRegion {
     pub fn overlaps(&self, other: &VmRegion) -> bool {
         let a_end = self.base.wrapping_add(self.len);
         let b_end = other.base.wrapping_add(other.len);
-        let no_overlap = a_end <= other.base || b_end < self.base;
-        !no_overlap
+        a_end > other.base && b_end >= self.base
     }
 
     pub fn split_at(&self, addr: usize) -> Option<(VmRegion, VmRegion)> {
@@ -710,6 +710,9 @@ impl VmRegion {
         let mut lf = self.flags;
         let mut rf = self.flags;
         lf &= !VM_GROWSDOWN;
+
+        // left half is not a part of stack now
+        // right half can still grow down after left half is cleared
 
         let l = VmRegion {
             base: self.base,
@@ -1239,7 +1242,6 @@ pub fn heap_grow(pool: &FramePool, n: usize) -> Vec<(usize, usize)> {
     addrs
 }
 
-
 pub fn defragment_frame_pool(slots: &mut Vec<bool>) -> usize {
     let mut free_count = 0;
     let mut last_used = 0;
@@ -1307,7 +1309,6 @@ pub fn verify_page_alignment(addr: usize, order: usize) -> bool {
     };
     aligned && in_range && valid_order && cross_check
 }
-
 
 pub fn validate_access(mode: u8, addr: usize, len: usize, pid: usize) -> Result<(), &'static str> {
     if len == 0 {
